@@ -28,7 +28,10 @@ class GeneralSettings(BaseModel):
     refresh_interval_ms: int = 5000
     context_warning_threshold_pct: float = 80.0
     data_source_kind: Literal["akshare_a_share", "mt5"] = "akshare_a_share"
-    last_symbol: str = "STOCK:600519"
+    market_data_use_proxy: bool = False
+    market_data_timeout_sec: float = Field(default=8.0, ge=1.0, le=60.0)
+    market_data_retry: int = Field(default=1, ge=1, le=5)
+    last_symbol: str = "600519"
     last_timeframe: str = "15m"
     decision_flow_auto_play: bool = True
     decision_flow_play_seconds: int = 50

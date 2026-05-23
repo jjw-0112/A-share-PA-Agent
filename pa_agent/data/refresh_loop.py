@@ -29,6 +29,7 @@ class RefreshLoop(QThread):
 
     frame_ready = pyqtSignal(list)
     status_changed = pyqtSignal(str)
+    market_status_changed = pyqtSignal(object)
 
     def __init__(
         self,
@@ -47,6 +48,8 @@ class RefreshLoop(QThread):
         self._cancel_token = cancel_token
         self._consecutive_failures = 0
         self._failure_threshold_s = 5.0
+        self._last_error_signature: str | None = None
+        self._last_error_log_ts: float = 0.0
 
     def run(self) -> None:  # noqa: C901
         """Main loop — runs on the worker thread."""
@@ -63,6 +66,9 @@ class RefreshLoop(QThread):
                 bars = self._source.latest_snapshot(self._n_bars + 5)
                 self._consecutive_failures = 0
                 failure_start = None
+                latest_status = getattr(self._source, "last_status", None)
+                if latest_status is not None:
+                    self.market_status_changed.emit(latest_status)
 
                 if bars:
                     if bars[0].closed:
@@ -82,8 +88,14 @@ class RefreshLoop(QThread):
                         self.status_changed.emit(status)
 
             except DataSourceTransientError as exc:
-                logger.warning("RefreshLoop transient error: %s", exc)
+                if "stale market data" in str(exc):
+                    logger.debug("RefreshLoop discarded stale market data result")
+                    continue
+                self._log_transient_error(exc)
                 self._consecutive_failures += 1
+                latest_status = getattr(self._source, "last_status", None)
+                if latest_status is not None:
+                    self.market_status_changed.emit(latest_status)
                 if failure_start is None:
                     failure_start = time.monotonic()
                 elapsed = time.monotonic() - failure_start
@@ -98,3 +110,17 @@ class RefreshLoop(QThread):
             sleep_ms = max(0.0, self._interval_ms - elapsed_ms)
             if sleep_ms > 0:
                 time.sleep(sleep_ms / 1000.0)
+
+    def set_n_bars(self, n_bars: int) -> None:
+        """Update requested bars for the next refresh cycle."""
+        self._n_bars = max(1, int(n_bars))
+
+    def _log_transient_error(self, exc: Exception) -> None:
+        signature = str(exc)
+        now = time.monotonic()
+        if signature == self._last_error_signature and now - self._last_error_log_ts < 30.0:
+            logger.debug("RefreshLoop transient error throttled: %s", exc)
+            return
+        self._last_error_signature = signature
+        self._last_error_log_ts = now
+        logger.warning("RefreshLoop transient error: %s", exc)

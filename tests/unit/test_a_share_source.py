@@ -110,6 +110,66 @@ def test_empty_data_and_endpoint_errors_are_transient(monkeypatch: pytest.Monkey
     with pytest.raises(DataSourceTransientError):
         src.latest_snapshot(2)
 
+
+def test_daily_fallback_uses_sina_when_eastmoney_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    called: list[str] = []
+
+    def eastmoney(**kwargs):
+        del kwargs
+        called.append("eastmoney")
+        raise RuntimeError("proxy down")
+
+    def sina(**kwargs):
+        called.append(f"sina:{kwargs['symbol']}")
+        return pd.DataFrame(
+            {
+                "date": ["2026-05-21", "2026-05-22"],
+                "open": [10.0, 10.2],
+                "high": [10.5, 10.7],
+                "low": [9.8, 10.1],
+                "close": [10.2, 10.6],
+                "volume": [1000, 1100],
+            }
+        )
+
+    src = _connected_source(
+        monkeypatch,
+        SimpleNamespace(stock_zh_a_hist=eastmoney, stock_zh_a_daily=sina),
+    )
+    src.subscribe("000006", "1d")
+    bars = src.latest_snapshot(2)
+
+    assert called == ["eastmoney", "sina:sz000006"]
+    assert len(bars) == 2
+    assert bars[0].close == pytest.approx(10.6)
+    assert src.last_provider == "sina-stock-daily"
+    assert src.last_warning and "eastmoney-stock-daily" in src.last_warning
+
+
+def test_hk_stock_daily_route(monkeypatch: pytest.MonkeyPatch) -> None:
+    called: list[str] = []
+
+    def stock_hk_hist(**kwargs):
+        called.append(kwargs["symbol"])
+        return pd.DataFrame(
+            {
+                "日期": ["2026-05-21", "2026-05-22"],
+                "开盘": [300.0, 301.0],
+                "最高": [305.0, 306.0],
+                "最低": [298.0, 299.0],
+                "收盘": [303.0, 304.0],
+                "成交量": [10000, 12000],
+            }
+        )
+
+    src = _connected_source(monkeypatch, SimpleNamespace(stock_hk_hist=stock_hk_hist))
+    src.subscribe("00700.HK", "1d")
+    bars = src.latest_snapshot(2)
+
+    assert called == ["00700"]
+    assert len(bars) == 2
+    assert bars[0].close == pytest.approx(304.0)
+
     def boom(**kwargs):
         del kwargs
         raise RuntimeError("network down")

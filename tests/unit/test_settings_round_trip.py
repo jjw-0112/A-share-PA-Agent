@@ -39,8 +39,11 @@ def test_defaults(tmp_path, fake_secret_store):
     assert s.general.default_bar_count == 100
     assert s.general.data_source_kind == "akshare_a_share"
     assert s.general.refresh_interval_ms == 5000
-    assert s.general.last_symbol == "STOCK:600519"
+    assert s.general.last_symbol == "600519"
     assert s.general.last_timeframe == "15m"
+    assert s.general.market_data_use_proxy is False
+    assert s.general.market_data_timeout_sec == 8.0
+    assert s.general.market_data_retry == 1
     assert s.general.decision_stance == "balanced"
     assert s.general.decision_flow_auto_play is True
     assert p.exists(), "defaults should be written to disk"

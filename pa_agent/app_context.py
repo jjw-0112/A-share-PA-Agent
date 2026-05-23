@@ -17,6 +17,7 @@ class AppContext:
     # Data layer
     data_source: Any = None       # DataSource implementation
     buffer: Any = None            # KlineBuffer
+    market_data_cache: Any = None # Latest successful chart bars for analysis fallback
 
     # AI / orchestration layer
     client: Any = None            # DeepSeekClient
@@ -41,6 +42,7 @@ class AppContext:
         from pa_agent.util.event_bus import EventBus
         from pa_agent.security.secret_store import mask_secret
         from pa_agent.data.kline_buffer import KlineBuffer
+        from pa_agent.data.market_data_cache import MarketDataCache
         from pa_agent.ai.deepseek_client import DeepSeekClient
         from pa_agent.ai.prompt_assembler import PromptAssembler
         from pa_agent.ai.router import route_strategy_files
@@ -62,6 +64,7 @@ class AppContext:
 
         # ── Data layer ────────────────────────────────────────────────────────
         buffer = KlineBuffer(capacity=1000)
+        market_data_cache = MarketDataCache()
         source_kind = getattr(settings.general, "data_source_kind", "akshare_a_share")
         if source_kind == "mt5":
             from pa_agent.data.mt5 import MT5Source
@@ -70,7 +73,11 @@ class AppContext:
         else:
             from pa_agent.data.a_share import AShareSource
 
-            data_source = AShareSource()
+            data_source = AShareSource(
+                use_proxy=getattr(settings.general, "market_data_use_proxy", False),
+                timeout_sec=getattr(settings.general, "market_data_timeout_sec", 8.0),
+                retry=getattr(settings.general, "market_data_retry", 1),
+            )
 
         # Subscribe to the last-used symbol/timeframe from settings
         try:
@@ -78,7 +85,7 @@ class AppContext:
             timeframe = settings.general.last_timeframe
             checker = getattr(data_source, "is_symbol_available", None)
             if callable(checker) and not checker(symbol):
-                symbol = "STOCK:600519"
+                symbol = "600519"
             supported_timeframes = data_source.supported_timeframes()
             if timeframe not in supported_timeframes:
                 timeframe = "15m"
@@ -127,6 +134,7 @@ class AppContext:
             event_bus=event_bus,
             data_source=data_source,
             buffer=buffer,
+            market_data_cache=market_data_cache,
             client=client,
             assembler=assembler,
             router=router,

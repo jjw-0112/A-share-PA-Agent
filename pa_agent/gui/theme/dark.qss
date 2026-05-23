@@ -111,15 +111,48 @@ QPushButton:hover {
 }
 QPushButton:pressed {
     background-color: #161b22;
+    padding-top: 7px;
+    padding-bottom: 5px;
 }
 QPushButton:disabled {
     color: #6e7681;
     background-color: #161b22;
 }
+QPushButton[state="loading"] {
+    color: #d29922;
+    background-color: #2d2412;
+    border-color: #d29922;
+    font-weight: bold;
+}
+QPushButton[state="success"] {
+    color: #ffffff;
+    background-color: #238636;
+    border-color: #3fb950;
+    font-weight: bold;
+}
+QPushButton[state="error"] {
+    color: #ffffff;
+    background-color: #da3633;
+    border-color: #f85149;
+    font-weight: bold;
+}
+QPushButton[state="disabled"] {
+    color: #6e7681;
+    background-color: #161b22;
+    border-color: #30363d;
+}
 QPushButton#primaryButton {
     background-color: #238636;
     border-color: #2ea043;
     font-weight: bold;
+}
+QPushButton#primaryButton[state="loading"] {
+    background-color: #2d2412;
+    border-color: #d29922;
+}
+QPushButton#primaryButton[state="error"] {
+    background-color: #da3633;
+    border-color: #f85149;
 }
 QPushButton#primaryButton:hover {
     background-color: #2ea043;
@@ -223,6 +256,32 @@ QLabel#stageHeader {
     font-size: 14px;
     font-weight: bold;
     color: #58a6ff;
+}
+
+QFrame#statusPanel {
+    background-color: #0d1117;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+}
+QFrame#statusPanel[level="fetching"] {
+    border-color: #58a6ff;
+}
+QFrame#statusPanel[level="success"] {
+    border-color: #3fb950;
+}
+QFrame#statusPanel[level="warning"] {
+    border-color: #d29922;
+}
+QFrame#statusPanel[level="error"] {
+    border-color: #f85149;
+}
+QLabel#statusPanelTitle {
+    color: #e6edf3;
+    font-weight: bold;
+}
+QLabel#statusPanelBody {
+    color: #8b949e;
+    font-size: 11px;
 }
 
 QFrame#aiTurnCard {

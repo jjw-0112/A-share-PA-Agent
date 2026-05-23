@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
-from PyQt6.QtCore import QThread, pyqtSignal, QObject
+from PyQt6.QtCore import QThread, QTimer, pyqtSignal, QObject
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -27,6 +28,15 @@ from PyQt6.QtGui import QAction
 from PyQt6.QtCore import Qt
 
 from pa_agent.app_context import AppContext
+from pa_agent.data.market_status import (
+    AnalysisStage,
+    AnalysisStatus,
+    DataStatusLevel,
+    MarketDataStatus,
+)
+from pa_agent.data.symbol_resolver import is_partial_symbol_input, resolve_symbol
+from pa_agent.gui.widgets.action_button import ActionButton
+from pa_agent.gui.widgets.status_panel import StatusPanel
 
 logger = logging.getLogger(__name__)
 
@@ -151,14 +161,18 @@ class MainWindow(QMainWindow):
 
     def __init__(self, ctx: AppContext, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("PA Agent — Trading Terminal")
+        self.setWindowTitle("PA Agent — A股/港股分析助手")
         self.resize(1500, 860)
         self._ctx = ctx
         self._worker: _AnalysisWorker | None = None
         self._cancel_token: Any = None
         self._analysis_in_progress = False
         self._last_analysis_had_error = False
+        self._analysis_started_at = 0.0
+        self._analysis_status: AnalysisStatus | None = None
+        self._active_analysis_button: ActionButton | None = None
         self._switching = False
+        self._symbol_apply_pending = False
         self._chart_refresh_paused = False
         self._pending_submit_after_close = False
         self._pending_force_incremental = False
@@ -228,6 +242,14 @@ class MainWindow(QMainWindow):
         self._status_bar.addWidget(self._demo_mode_label, 1)
         self._status_bar.showMessage("就绪")
         self._sync_submit_button_state()
+        self._set_analysis_status(AnalysisStage.IDLE, "等待提交分析")
+        self._set_market_status(
+            DataStatusLevel.IDLE,
+            "等待行情刷新",
+            raw_input=self._symbol_combo.currentText().strip() if hasattr(self, "_symbol_combo") else "",
+            timeframe=self._tf_combo.currentText() if hasattr(self, "_tf_combo") else "",
+            bar_count=self._bar_count_spin.value() if hasattr(self, "_bar_count_spin") else 0,
+        )
 
         # ── Menu bar ──────────────────────────────────────────────────────────
         menu_bar: QMenuBar = self.menuBar()  # type: ignore[assignment]
@@ -250,8 +272,8 @@ class MainWindow(QMainWindow):
         ctrl_layout = QHBoxLayout()
         ctrl_layout.setSpacing(8)
 
-        # Symbol - editable combo (user can type A-share stock/ETF/index codes)
-        ctrl_layout.addWidget(QLabel("A股代码:"))
+        # Symbol - editable combo (user can type quote-app style CN/HK codes)
+        ctrl_layout.addWidget(QLabel("代码:"))
         self._symbol_combo = QComboBox()
         self._symbol_combo.setEditable(True)
         data_source = getattr(self._ctx, "data_source", None)
@@ -259,27 +281,32 @@ class MainWindow(QMainWindow):
             data_source.list_symbols()
             if data_source is not None and callable(getattr(data_source, "list_symbols", None))
             else [
-                "STOCK:600519",
-                "STOCK:300750",
-                "STOCK:000001",
-                "ETF:510300",
-                "ETF:159915",
-                "INDEX:sh000001",
-                "INDEX:sz399001",
-                "INDEX:sz399006",
+                "600519",
+                "300750",
+                "000001",
+                "510300",
+                "159915",
+                "000001.SH",
+                "399001",
+                "399006",
+                "00700.HK",
+                "09988.HK",
+                "02800.HK",
+                "HSI",
+                "HSTECH",
             ]
         )
         self._symbol_combo.addItems(default_symbols)
         # Restore last-used symbol from settings
-        _last_symbol = "STOCK:600519"
+        _last_symbol = "600519"
         _last_tf = "15m"
         _settings = getattr(self._ctx, "settings", None)
         if _settings is not None:
-            _last_symbol = getattr(_settings.general, "last_symbol", "STOCK:600519") or "STOCK:600519"
+            _last_symbol = getattr(_settings.general, "last_symbol", "600519") or "600519"
             _last_tf = getattr(_settings.general, "last_timeframe", "15m") or "15m"
         self._symbol_combo.setCurrentText(_last_symbol)
         self._symbol_combo.setMinimumWidth(110)
-        self._symbol_combo.lineEdit().setPlaceholderText("输入代码，如 600519 / ETF:510300 / INDEX:sh000001")
+        self._symbol_combo.lineEdit().setPlaceholderText("如 600519 / 000001.SH / 00700.HK / HSI")
         ctrl_layout.addWidget(self._symbol_combo)
 
         self._symbol_alert_label = QLabel("")
@@ -310,6 +337,16 @@ class MainWindow(QMainWindow):
         self._bar_count_spin.setMinimumWidth(70)
         ctrl_layout.addWidget(self._bar_count_spin)
 
+        self._apply_market_btn = ActionButton("应用")
+        self._apply_market_btn.setMinimumWidth(72)
+        self._apply_market_btn.setToolTip("应用当前代码、周期和K线数量")
+        ctrl_layout.addWidget(self._apply_market_btn)
+
+        self._refresh_market_btn = ActionButton("刷新行情")
+        self._refresh_market_btn.setMinimumWidth(88)
+        self._refresh_market_btn.setToolTip("立即重新获取当前标的行情")
+        ctrl_layout.addWidget(self._refresh_market_btn)
+
         ctrl_layout.addStretch()
 
         self._wait_close_checkbox = QCheckBox("等待最新K线收盘后再提交分析")
@@ -326,13 +363,13 @@ class MainWindow(QMainWindow):
         self._wait_close_countdown_label.setMinimumWidth(100)
         ctrl_layout.addWidget(self._wait_close_countdown_label)
 
-        self._submit_btn = QPushButton("提交分析")
+        self._submit_btn = ActionButton("提交分析")
         self._submit_btn.setObjectName("primaryButton")
         self._submit_btn.setMinimumWidth(100)
         self._submit_btn.clicked.connect(self._on_submit_analysis)
         ctrl_layout.addWidget(self._submit_btn)
 
-        self._incremental_submit_btn = QPushButton("增量分析")
+        self._incremental_submit_btn = ActionButton("增量分析")
         self._incremental_submit_btn.setMinimumWidth(100)
         self._incremental_submit_btn.setToolTip(
             "强制基于同品种/周期最近一条成功记录做增量分析，"
@@ -353,7 +390,7 @@ class MainWindow(QMainWindow):
         self._resume_chart_btn.clicked.connect(self._on_resume_chart_refresh)
         ctrl_layout.addWidget(self._resume_chart_btn)
 
-        self._fit_chart_btn = QPushButton("自适应")
+        self._fit_chart_btn = ActionButton("自适应")
         self._fit_chart_btn.setMinimumWidth(72)
         self._fit_chart_btn.setToolTip("恢复完整K线视图，并按当前窗口自动适配价格轴")
         ctrl_layout.addWidget(self._fit_chart_btn)
@@ -383,6 +420,19 @@ class MainWindow(QMainWindow):
 
         outer_layout.addLayout(status_row)
 
+        panel_row = QHBoxLayout()
+        panel_row.setSpacing(8)
+        self._market_status_panel = StatusPanel("行情状态")
+        self._analysis_status_panel = StatusPanel("分析状态")
+        panel_row.addWidget(self._market_status_panel, 1)
+        panel_row.addWidget(self._analysis_status_panel, 1)
+        outer_layout.addLayout(panel_row)
+
+        self._symbol_apply_timer = QTimer(tab)
+        self._symbol_apply_timer.setSingleShot(True)
+        self._symbol_apply_timer.setInterval(500)
+        self._symbol_apply_timer.timeout.connect(lambda: self._apply_symbol_controls(force=False))
+
         workbench = QSplitter(Qt.Orientation.Horizontal)
 
         self._chart_widget = ChartWidget()
@@ -402,13 +452,19 @@ class MainWindow(QMainWindow):
 
         outer_layout.addWidget(workbench, stretch=1)
 
-        # Connect symbol/timeframe combo boxes to the switch handler
+        # Connect market controls to a debounced apply path.
         self._symbol_combo.currentTextChanged.connect(self._on_symbol_combo_text_changed)
         self._tf_combo.currentTextChanged.connect(
-            lambda _: self._on_symbol_or_tf_changed(
-                self._symbol_combo.currentText(), self._tf_combo.currentText()
-            )
+            lambda _: self._schedule_symbol_apply("周期已变更")
         )
+        self._bar_count_spin.valueChanged.connect(
+            lambda _: self._schedule_symbol_apply("K线数已变更")
+        )
+        line_edit = self._symbol_combo.lineEdit()
+        if line_edit is not None:
+            line_edit.returnPressed.connect(lambda: self._apply_symbol_controls(force=True))
+        self._apply_market_btn.clicked.connect(lambda: self._apply_symbol_controls(force=True))
+        self._refresh_market_btn.clicked.connect(self._on_refresh_market_clicked)
 
         return tab
 
@@ -455,6 +511,8 @@ class MainWindow(QMainWindow):
         # Wire RefreshLoop signals
         self._refresh_loop.frame_ready.connect(self._on_refresh_frame_ready)
         self._refresh_loop.status_changed.connect(self._on_status_update)
+        if hasattr(self._refresh_loop, "market_status_changed"):
+            self._refresh_loop.market_status_changed.connect(self._on_market_status_update)
 
         self._refresh_loop.start()
         logger.info("RefreshLoop started for %s %s",
@@ -465,12 +523,101 @@ class MainWindow(QMainWindow):
     # ── Slots ─────────────────────────────────────────────────────────────────
 
     def _on_symbol_combo_text_changed(self, _text: str = "") -> None:
-        """React to symbol edits and keep timeframe subscription in sync."""
+        """React to symbol edits without breaking the current subscription."""
         self._update_symbol_mt5_alert()
-        self._on_symbol_or_tf_changed(
-            self._symbol_combo.currentText(),
-            self._tf_combo.currentText(),
-        )
+        text = self._symbol_combo.currentText().strip()
+        if self._is_partial_symbol_text(text):
+            if hasattr(self, "_symbol_apply_timer"):
+                self._symbol_apply_timer.stop()
+            self._set_market_status(
+                DataStatusLevel.IDLE,
+                "等待输入完整代码，旧图表已保留",
+                raw_input=text,
+                timeframe=self._tf_combo.currentText(),
+                bar_count=self._bar_count_spin.value(),
+            )
+            return
+        self._schedule_symbol_apply("代码已变更")
+
+    def _is_partial_symbol_text(self, text: str) -> bool:
+        """Return True for in-progress quote codes that should not switch yet."""
+        raw = (text or "").strip()
+        if is_partial_symbol_input(raw):
+            return True
+        # Five-digit HK codes are valid when the user presses Enter / 应用.
+        # During passive typing, treat them as incomplete to avoid cancelling an
+        # A-share subscription at the 00000 intermediate state.
+        return raw.isdigit() and len(raw) == 5
+
+    def _schedule_symbol_apply(self, reason: str = "") -> None:
+        """Debounce market-control edits before attempting a subscription switch."""
+        if self._switching:
+            return
+        text = self._symbol_combo.currentText().strip()
+        if self._is_partial_symbol_text(text):
+            self._set_market_status(
+                DataStatusLevel.IDLE,
+                "等待输入完整代码，旧图表已保留",
+                raw_input=text,
+                timeframe=self._tf_combo.currentText(),
+                bar_count=self._bar_count_spin.value(),
+            )
+            return
+        self._symbol_apply_pending = True
+        if reason:
+            self._status_bar.showMessage(f"{reason}，准备刷新行情…")
+        if hasattr(self, "_symbol_apply_timer"):
+            self._symbol_apply_timer.start()
+
+    def _apply_symbol_controls(self, *, force: bool) -> None:
+        """Validate controls, atomically switch subscription, then refresh once."""
+        if self._switching:
+            return
+        if hasattr(self, "_symbol_apply_timer"):
+            self._symbol_apply_timer.stop()
+        symbol = self._symbol_combo.currentText().strip()
+        timeframe = self._tf_combo.currentText()
+        bar_count = int(self._bar_count_spin.value())
+        if not force and self._is_partial_symbol_text(symbol):
+            self._set_market_status(
+                DataStatusLevel.IDLE,
+                "等待输入完整代码，旧图表已保留",
+                raw_input=symbol,
+                timeframe=timeframe,
+                bar_count=bar_count,
+            )
+            return
+        btn = getattr(self, "_apply_market_btn", None)
+        if btn is not None:
+            btn.set_loading("应用中…")
+            logger.info("[ui] button=apply_market state=loading")
+        ok = self._on_symbol_or_tf_changed(symbol, timeframe, bar_count=bar_count)
+        if btn is not None:
+            if ok:
+                btn.set_success("已应用")
+                logger.info("[ui] button=apply_market state=success")
+            else:
+                btn.set_error("应用失败")
+                logger.info("[ui] button=apply_market state=error")
+
+    def _on_refresh_market_clicked(self) -> None:
+        """Refresh current market data on demand with visible button feedback."""
+        btn = getattr(self, "_refresh_market_btn", None)
+        if btn is not None and not btn.isEnabled():
+            return
+        if btn is not None:
+            btn.set_loading("刷新中…")
+            logger.info("[ui] button=refresh_market state=loading")
+        ok = self._refresh_chart_once(interactive=True)
+        if btn is not None:
+            if ok:
+                source = getattr(self._ctx, "data_source", None)
+                warning = getattr(source, "last_warning", None)
+                btn.set_success("已使用备用源" if warning else "已刷新")
+                logger.info("[ui] button=refresh_market state=success")
+            else:
+                btn.set_error("刷新失败")
+                logger.info("[ui] button=refresh_market state=error")
 
     def _update_symbol_mt5_alert(self) -> None:
         """Show a hint when the typed symbol cannot be parsed by the data source."""
@@ -481,19 +628,26 @@ class MainWindow(QMainWindow):
         if not symbol:
             label.hide()
             return
-        data_source = getattr(self._ctx, "data_source", None)
-        checker = getattr(data_source, "is_symbol_available", None)
-        if not getattr(data_source, "_connected", False) or not callable(checker):
-            label.hide()
+        if self._is_partial_symbol_text(symbol):
+            label.setText("正在输入代码，输入完整后按 Enter 或点击「应用」。")
+            label.setStyleSheet("color: #e6b800; font-size: 11px;")
+            label.show()
             return
-        if checker(symbol):
-            label.hide()
+        try:
+            resolved = resolve_symbol(symbol)
+        except Exception:
+            label.setText(
+                "未识别该标的。可输入 600519、000001.SH、399006、00700.HK、HSI。"
+            )
+            label.setStyleSheet("color: #f85149; font-size: 11px;")
+            label.show()
             return
-        label.setText(
-            "未识别该A股标的。可输入 600519、STOCK:600519、ETF:510300 "
-            "或 INDEX:sh000001。"
-        )
-        label.show()
+        if resolved.warning:
+            label.setText(resolved.warning)
+            label.setStyleSheet("color: #e6b800; font-size: 11px;")
+            label.show()
+        else:
+            label.hide()
 
     def _on_status_update(self, text: str) -> None:
         """Update the status bar with subscription / analysis / data-delay text."""
@@ -504,6 +658,106 @@ class MainWindow(QMainWindow):
             panel = getattr(self, "_stream_panel", None)
             if panel is not None:
                 panel.on_analysis_progress(text)
+            if "阶段一分析中" in text or "阶段二分析中" in text:
+                logger.info("[analysis] calling LLM: %s", text)
+                stage = AnalysisStage.CALLING_LLM
+            elif "完成" in text:
+                logger.info("[analysis] LLM response received: %s", text)
+                stage = AnalysisStage.VALIDATING_JSON
+            elif "失败" in text:
+                logger.warning("[analysis] failed at llm/json stage: %s", text)
+                stage = AnalysisStage.ERROR
+            else:
+                stage = AnalysisStage.BUILDING_PROMPT
+            self._set_analysis_status(
+                stage,
+                text,
+                symbol=self._symbol_combo.currentText().strip(),
+                timeframe=self._tf_combo.currentText(),
+            )
+
+    def _on_market_status_update(self, status: object) -> None:
+        """Receive structured market data status from RefreshLoop/source."""
+        if isinstance(status, MarketDataStatus):
+            panel = getattr(self, "_market_status_panel", None)
+            if panel is not None:
+                panel.set_market_status(status)
+            if status.message:
+                self._status_bar.showMessage(status.message)
+
+    def _set_market_status(
+        self,
+        level: DataStatusLevel,
+        message: str,
+        *,
+        raw_input: str = "",
+        resolved_symbol: str | None = None,
+        market: str | None = None,
+        asset_type: str | None = None,
+        timeframe: str = "",
+        bar_count: int = 0,
+        provider: str | None = None,
+        bars_returned: int | None = None,
+        latest_bar_time: Any = None,
+        latency_ms: int | None = None,
+        last_error: str | None = None,
+        warning: str | None = None,
+    ) -> None:
+        """Set market status panel from UI-controlled events."""
+        status = MarketDataStatus(
+            level=level,
+            raw_input=raw_input,
+            resolved_symbol=resolved_symbol,
+            market=market,
+            asset_type=asset_type,
+            timeframe=timeframe,
+            bar_count=bar_count,
+            provider=provider,
+            message=message,
+            last_request_at=None,
+            last_success_at=None,
+            bars_returned=bars_returned,
+            latest_bar_time=latest_bar_time,
+            latency_ms=latency_ms,
+            last_error=last_error,
+            warning=warning,
+        )
+        panel = getattr(self, "_market_status_panel", None)
+        if panel is not None:
+            panel.set_market_status(status)
+        if getattr(self, "_status_bar", None) is not None and message:
+            self._status_bar.showMessage(message)
+
+    def _set_analysis_status(
+        self,
+        stage: AnalysisStage,
+        message: str,
+        *,
+        symbol: str | None = None,
+        timeframe: str | None = None,
+        bars_count: int | None = None,
+        provider: str | None = None,
+        last_error: str | None = None,
+    ) -> None:
+        """Set analysis status panel independently from market refresh state."""
+        now = time.monotonic()
+        latency_ms = None
+        if stage in (AnalysisStage.SUCCESS, AnalysisStage.ERROR) and self._analysis_started_at:
+            latency_ms = int((now - self._analysis_started_at) * 1000)
+        status = AnalysisStatus(
+            stage=stage,
+            message=message,
+            symbol=symbol or (self._symbol_combo.currentText().strip() if hasattr(self, "_symbol_combo") else None),
+            timeframe=timeframe or (self._tf_combo.currentText() if hasattr(self, "_tf_combo") else None),
+            bars_count=bars_count,
+            provider=provider,
+            latency_ms=latency_ms,
+            last_error=last_error,
+        )
+        self._analysis_status = status
+        panel = getattr(self, "_analysis_status_panel", None)
+        if panel is not None:
+            panel.set_analysis_status(status)
 
     def _set_chart_refresh_paused(self, paused: bool) -> None:
         """Pause or resume live chart updates from RefreshLoop."""
@@ -520,24 +774,101 @@ class MainWindow(QMainWindow):
         self._status_bar.showMessage("图表已恢复实时更新")
         self._refresh_chart_once()
 
-    def _refresh_chart_once(self) -> None:
+    def _refresh_chart_once(self, *, interactive: bool = False) -> bool:
         """Apply one immediate chart refresh (e.g. after resuming)."""
-        self._pull_chart_frame_from_source()
+        frame = self._pull_chart_frame_from_source(apply=True, interactive=interactive)
+        return frame is not None
 
-    def _pull_chart_frame_from_source(self) -> Any:
+    def _pull_chart_frame_from_source(self, *, apply: bool = False, interactive: bool = False) -> Any:
         """Fetch latest bars from the active data source and return the chart display frame."""
         data_source = getattr(self._ctx, "data_source", None)
         if data_source is None or not getattr(data_source, "_connected", False):
+            self._set_market_status(
+                DataStatusLevel.ERROR,
+                "行情源未连接",
+                raw_input=self._symbol_combo.currentText().strip(),
+                timeframe=self._tf_combo.currentText(),
+                bar_count=self._bar_count_spin.value(),
+                last_error="行情源未连接",
+            )
             return None
         try:
             n_bars = self._bar_count_spin.value() + 5
+            self._set_market_status(
+                DataStatusLevel.FETCHING,
+                "正在获取行情…",
+                raw_input=self._symbol_combo.currentText().strip(),
+                timeframe=self._tf_combo.currentText(),
+                bar_count=self._bar_count_spin.value(),
+            )
             bars = data_source.latest_snapshot(n_bars)
             if not bars:
                 return None
-            return self._build_chart_frame_from_bars(bars, include_forming=True)
+            frame = self._build_chart_frame_from_bars(bars, include_forming=True)
+            if apply and frame is not None:
+                self._apply_bars_to_chart(bars, include_forming=True)
+            return frame
         except Exception as exc:  # noqa: BLE001
-            logger.debug("Chart frame pull failed: %s", exc)
+            logger.warning("Chart frame pull failed: %s", exc)
+            self._set_market_status(
+                DataStatusLevel.ERROR,
+                "行情刷新失败，旧图表已保留",
+                raw_input=self._symbol_combo.currentText().strip(),
+                timeframe=self._tf_combo.currentText(),
+                bar_count=self._bar_count_spin.value(),
+                provider=getattr(data_source, "last_provider", None),
+                last_error=str(exc),
+            )
+            if interactive:
+                QMessageBox.warning(self, "行情刷新失败", str(exc))
             return None
+
+    def _apply_bars_to_chart(self, bars: Any, *, include_forming: bool = True) -> bool:
+        """Render bars, update latest-bars cache, and surface source status."""
+        if not bars:
+            return False
+        try:
+            frame = self._build_chart_frame_from_bars(bars, include_forming=include_forming)
+            if frame is None:
+                return False
+            self._chart_widget.set_frame(frame)
+            self._cache_latest_bars(bars)
+            self._last_refresh_ts = time.monotonic()
+            self._update_refresh_elapsed()
+            source = getattr(self._ctx, "data_source", None)
+            status = getattr(source, "last_status", None)
+            if isinstance(status, MarketDataStatus):
+                self._on_market_status_update(status)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Frame build skipped: %s", exc)
+            return False
+
+    def _cache_latest_bars(self, bars: Any) -> None:
+        """Store successful chart bars for submit-analysis fallback."""
+        cache = getattr(self._ctx, "market_data_cache", None)
+        if cache is None or not bars:
+            return
+        data_source = getattr(self._ctx, "data_source", None)
+        resolved = getattr(data_source, "_resolved", None)
+        raw = self._symbol_combo.currentText().strip()
+        timeframe = self._tf_combo.currentText()
+        try:
+            if resolved is None:
+                resolved = resolve_symbol(raw)
+            cache.update(
+                raw_input=raw,
+                resolved_symbol=getattr(resolved, "display_symbol", raw),
+                market=getattr(getattr(resolved, "market", None), "value", ""),
+                asset_type=getattr(getattr(resolved, "asset_type", None), "value", ""),
+                timeframe=timeframe,
+                requested_bar_count=self._bar_count_spin.value(),
+                bars=bars,
+                provider=getattr(data_source, "last_provider", None) or "chart-cache",
+                warning=getattr(data_source, "last_warning", None),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("latest bars cache update skipped: %s", exc)
 
     def snapshot_klines_for_followup(self) -> str:
         """Refresh chart once, freeze updates, return K-line table matching the chart."""
@@ -545,7 +876,7 @@ class MainWindow(QMainWindow):
 
         from pa_agent.ai.prompt_assembler import PromptAssembler
 
-        frame = self._pull_chart_frame_from_source()
+        frame = self._pull_chart_frame_from_source(apply=True)
         chart = getattr(self, "_chart_widget", None)
         if frame is not None and chart is not None:
             chart.set_frame_now(frame)
@@ -639,40 +970,65 @@ class MainWindow(QMainWindow):
         if alert is not None:
             alert.hide()
 
-        try:
-            import time as _time
+        self._apply_bars_to_chart(bars, include_forming=True)
 
-            frame = self._build_chart_frame_from_bars(bars, include_forming=True)
-            if frame is None:
-                return
-
-            self._chart_widget.set_frame(frame)
-
-            # Record the time of this successful chart update
-            self._last_refresh_ts = _time.monotonic()
-            self._update_refresh_elapsed()
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("Frame build skipped: %s", exc)
-
-    def _on_symbol_or_tf_changed(self, new_symbol: str, new_tf: str) -> None:
-        """Handle symbol or timeframe combo box change.
-
-        Steps (design §B.10, R3.1–R3.5):
-        1. Cancel current AI worker and wait up to 5 s (zombie if timeout).
-        2. Save partial record if analysis was in progress.
-        3. Unsubscribe data source, clear buffer, re-subscribe.
-        4. Reset ChartWidget.
-        5. Destroy FreeChatSession, disable Tab2 input.
-        6. Reset or preserve ledger based on settings.
-        """
+    def _on_symbol_or_tf_changed(
+        self,
+        new_symbol: str,
+        new_tf: str,
+        *,
+        bar_count: int | None = None,
+    ) -> bool:
+        """Validate and atomically switch symbol/timeframe without losing old chart."""
         if self._switching:
-            return  # Prevent re-entrant calls
+            return False  # Prevent re-entrant calls
 
         self._clear_pending_bar_close_wait()
 
         self._switching = True
         try:
-            # ── Step 1: Cancel current AI worker ─────────────────────────────
+            bar_count = int(bar_count if bar_count is not None else self._bar_count_spin.value())
+            data_source = getattr(self._ctx, "data_source", None)
+            buffer = getattr(self._ctx, "buffer", None)
+            if data_source is None:
+                self._set_market_status(
+                    DataStatusLevel.ERROR,
+                    "行情源未就绪，旧图表已保留",
+                    raw_input=new_symbol,
+                    timeframe=new_tf,
+                    bar_count=bar_count,
+                    last_error="data_source is None",
+                )
+                return False
+
+            try:
+                resolved = data_source.prepare_subscription(new_symbol, new_tf)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("prepare subscription failed for %s %s: %s", new_symbol, new_tf, exc)
+                self._set_market_status(
+                    DataStatusLevel.ERROR,
+                    f"切换失败，保留当前标的：{exc}",
+                    raw_input=new_symbol,
+                    timeframe=new_tf,
+                    bar_count=bar_count,
+                    last_error=str(exc),
+                )
+                self._update_symbol_mt5_alert()
+                return False
+
+            self._set_market_status(
+                DataStatusLevel.FETCHING,
+                f"正在切换到 {resolved.display_symbol} {new_tf}，请求 {bar_count} 根K线…",
+                raw_input=new_symbol,
+                resolved_symbol=resolved.display_symbol,
+                market=resolved.market.value,
+                asset_type=resolved.asset_type.value,
+                timeframe=new_tf,
+                bar_count=bar_count,
+                warning=getattr(resolved, "warning", None),
+            )
+
+            # ── Step 1: Cancel current AI worker after new controls are valid ──
             if self._worker is not None and self._worker.isRunning():
                 if self._cancel_token is not None:
                     self._cancel_token.set()
@@ -701,25 +1057,24 @@ class MainWindow(QMainWindow):
                 self._analysis_in_progress = False
                 self._update_submit_button_state()
 
-            # ── Step 3: Unsubscribe, clear buffer, re-subscribe ───────────────
-            data_source = getattr(self._ctx, "data_source", None)
-            buffer = getattr(self._ctx, "buffer", None)
-            if data_source is not None:
-                try:
-                    data_source.unsubscribe()
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("unsubscribe failed: %s", exc)
+            # ── Step 3: Subscribe new target; old chart stays visible until data succeeds.
+            try:
+                data_source.subscribe(new_symbol, new_tf)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("subscribe(%s, %s) failed: %s", new_symbol, new_tf, exc)
+                self._set_market_status(
+                    DataStatusLevel.ERROR,
+                    f"切换失败，保留当前标的：{exc}",
+                    raw_input=new_symbol,
+                    timeframe=new_tf,
+                    bar_count=bar_count,
+                    last_error=str(exc),
+                )
+                return False
             if buffer is not None:
                 buffer.clear()
-            if data_source is not None:
-                try:
-                    data_source.subscribe(new_symbol, new_tf)
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("subscribe(%s, %s) failed: %s", new_symbol, new_tf, exc)
-
-            # ── Step 4: Reset ChartWidget ─────────────────────────────────────
-            if hasattr(self, "_chart_widget"):
-                self._chart_widget.reset()
+            if self._refresh_loop is not None and hasattr(self._refresh_loop, "set_n_bars"):
+                self._refresh_loop.set_n_bars(bar_count)
 
             # ── Step 5: Destroy FreeChatSession, disable Tab2 input ───────────
             self._free_chat_session = None
@@ -735,8 +1090,8 @@ class MainWindow(QMainWindow):
 
             self._set_chart_refresh_paused(False)
 
-            self._status_bar.showMessage(f"已切换至 {new_symbol} {new_tf}")
-            logger.info("Symbol/TF switched to %s %s", new_symbol, new_tf)
+            self._status_bar.showMessage(f"已切换至 {resolved.display_symbol} {new_tf}，正在刷新行情…")
+            logger.info("Symbol/TF switched to %s %s", resolved.display_symbol, new_tf)
             self._update_symbol_mt5_alert()
 
             # Persist last-used symbol/timeframe to settings
@@ -749,6 +1104,9 @@ class MainWindow(QMainWindow):
                     save_settings(settings)
                 except Exception as exc:  # noqa: BLE001
                     logger.debug("Failed to persist symbol/tf to settings: %s", exc)
+
+            self._refresh_chart_once(interactive=False)
+            return True
 
         finally:
             self._switching = False
@@ -1272,14 +1630,47 @@ class MainWindow(QMainWindow):
         snapshot_bars: Any = None,
     ) -> None:
         """Build snapshot and run two-stage analysis (after optional bar-close wait)."""
+        logger.info("[analysis] submit clicked")
+        logger.info(
+            "[analysis] current symbol=%s timeframe=%s requested_bars=%s force_incremental=%s",
+            symbol,
+            timeframe,
+            bar_count,
+            force_incremental,
+        )
+        self._analysis_started_at = time.monotonic()
+        self._analysis_in_progress = True
+        self._last_analysis_had_error = False
+        active_button = self._incremental_submit_btn if force_incremental else self._submit_btn
+        self._active_analysis_button = active_button if isinstance(active_button, ActionButton) else None
+        if isinstance(active_button, ActionButton):
+            active_button.set_loading("增量分析中…" if force_incremental else "分析中…")
+            logger.info(
+                "[ui] button=%s state=loading",
+                "incremental_analysis" if force_incremental else "submit_analysis",
+            )
+        self._sync_submit_button_state()
+        self._set_analysis_status(
+            AnalysisStage.PREPARING_SNAPSHOT,
+            "正在准备行情快照…",
+            symbol=symbol,
+            timeframe=timeframe,
+        )
+
         frame = self._take_snapshot(symbol, timeframe, bar_count, bars_raw=snapshot_bars)
         if frame is None:
-            self._status_bar.showMessage("数据不足，请等待缓冲区填满后再提交")
+            self._fail_analysis_before_worker(
+                "行情快照获取失败，且没有可用图表缓存",
+                button=active_button,
+            )
             return
 
         orchestrator = self._build_orchestrator()
         if orchestrator is None:
-            self._status_bar.showMessage("编排器未就绪，请检查设置")
+            self._fail_analysis_before_worker(
+                "编排器未就绪，请检查设置",
+                button=active_button,
+            )
             return
 
         previous_record, incremental_new_bar_count, incremental_detail = (
@@ -1292,8 +1683,7 @@ class MainWindow(QMainWindow):
         )
         if force_incremental and previous_record is None:
             reason = self._incremental_unavailable_reason(frame, symbol, timeframe)
-            self._status_bar.showMessage(reason)
-            QMessageBox.warning(self, "无法增量分析", reason)
+            self._fail_analysis_before_worker(reason, button=active_button, show_message=True)
             return
 
         # Create cancel token
@@ -1327,9 +1717,7 @@ class MainWindow(QMainWindow):
 
         self._set_chart_refresh_paused(True)
 
-        self._analysis_in_progress = True
-        self._last_analysis_had_error = False
-        self._update_submit_button_state()
+        self._sync_submit_button_state()
         from pa_agent.ai.decision_stance import stance_label_zh
 
         stance_raw = "balanced"
@@ -1382,6 +1770,33 @@ class MainWindow(QMainWindow):
             Qt.ConnectionType.UniqueConnection,
         )
         self._worker.start()
+
+    def _fail_analysis_before_worker(
+        self,
+        message: str,
+        *,
+        button: Any = None,
+        show_message: bool = False,
+    ) -> None:
+        """Reset analysis UI for failures before the AI worker starts."""
+        logger.warning("[analysis] failed at snapshot stage: %s", message)
+        self._analysis_in_progress = False
+        self._last_analysis_had_error = True
+        self._active_analysis_button = None
+        self._set_analysis_status(
+            AnalysisStage.ERROR,
+            f"分析失败：{message}",
+            symbol=self._symbol_combo.currentText().strip(),
+            timeframe=self._tf_combo.currentText(),
+            last_error=message,
+        )
+        self._status_bar.showMessage(f"分析失败：{message}")
+        if isinstance(button, ActionButton):
+            button.set_error("分析失败")
+            logger.info("[ui] button=submit_analysis state=error")
+        self._sync_submit_button_state()
+        if show_message:
+            QMessageBox.warning(self, "无法分析", message)
 
     def _find_incremental_base_record(
         self,
@@ -1537,7 +1952,15 @@ class MainWindow(QMainWindow):
 
     def _on_analysis_error(self, message: str) -> None:
         """Unhandled exception in the analysis worker thread."""
+        logger.warning("[analysis] failed at worker stage: %s", message)
         self._last_analysis_had_error = True
+        self._set_analysis_status(
+            AnalysisStage.ERROR,
+            f"模型调用或程序执行失败：{message}",
+            symbol=self._symbol_combo.currentText().strip(),
+            timeframe=self._tf_combo.currentText(),
+            last_error=message,
+        )
         debug = getattr(self, "_debug_widget", None)
         if debug is not None:
             debug.add_turn({
@@ -1553,6 +1976,13 @@ class MainWindow(QMainWindow):
         """Push the full AnalysisRecord to the conversation and debug tabs."""
         import json as _json
 
+        logger.info("[analysis] validating JSON")
+        self._set_analysis_status(
+            AnalysisStage.VALIDATING_JSON,
+            "正在校验 AI 输出…",
+            symbol=self._symbol_combo.currentText().strip(),
+            timeframe=self._tf_combo.currentText(),
+        )
         exc_info = getattr(record, "exception", None)
         exc_json = (
             _json.dumps(exc_info, ensure_ascii=False, indent=2) if exc_info else ""
@@ -1602,6 +2032,7 @@ class MainWindow(QMainWindow):
             })
 
             if exc_info:
+                logger.warning("[analysis] failed at json validation stage: %s", exc_info)
                 debug.add_turn({
                     "label": "⚠ 异常",
                     "system_prompt": "",
@@ -1638,6 +2069,13 @@ class MainWindow(QMainWindow):
         self._last_stage1_diagnosis = s1_diag if isinstance(s1_diag, dict) else None
         s2_full = getattr(record, "stage2_decision", None)
         if s2_full:
+            logger.info("[analysis] rendering result")
+            self._set_analysis_status(
+                AnalysisStage.RENDERING,
+                "正在渲染分析结果…",
+                symbol=self._symbol_combo.currentText().strip(),
+                timeframe=self._tf_combo.currentText(),
+            )
             inner = s2_full.get("decision", s2_full)
             meta = getattr(record, "meta", None)
             stance = getattr(meta, "decision_stance", None) if meta is not None else None
@@ -1810,11 +2248,41 @@ class MainWindow(QMainWindow):
         """Reset in-progress flag and re-enable the submit button."""
         self._analysis_in_progress = False
         self._worker = None
-        self._update_submit_button_state()
         if self._last_analysis_had_error:
             self._status_bar.showMessage("分析结束（存在错误，请查看「原始」页调试信息）")
+            self._set_analysis_status(
+                AnalysisStage.ERROR,
+                "分析失败，请查看右侧原始页调试信息",
+                symbol=self._symbol_combo.currentText().strip(),
+                timeframe=self._tf_combo.currentText(),
+                last_error="AI 输出或程序校验失败",
+            )
+            button = self._active_analysis_button or self._submit_btn
+            if isinstance(button, ActionButton):
+                button.set_error("分析失败")
+                logger.info("[ui] button=submit_analysis state=error")
+            for other in (self._submit_btn, self._incremental_submit_btn):
+                if isinstance(other, ActionButton) and other is not button:
+                    other.reset_default()
+            logger.warning("[analysis] completed with errors")
         else:
             self._status_bar.showMessage("分析完成")
+            self._set_analysis_status(
+                AnalysisStage.SUCCESS,
+                "分析完成",
+                symbol=self._symbol_combo.currentText().strip(),
+                timeframe=self._tf_combo.currentText(),
+            )
+            button = self._active_analysis_button or self._submit_btn
+            if isinstance(button, ActionButton):
+                button.set_success("分析完成")
+                logger.info("[ui] button=submit_analysis state=success")
+            for other in (self._submit_btn, self._incremental_submit_btn):
+                if isinstance(other, ActionButton) and other is not button:
+                    other.reset_default()
+            logger.info("[analysis] completed")
+        self._active_analysis_button = None
+        self._update_submit_button_state()
 
     def _open_settings_dialog(self) -> None:
         """Open the SettingsDialog; import lazily to avoid circular imports."""
@@ -1971,22 +2439,87 @@ class MainWindow(QMainWindow):
         bars_raw: Any = None,
     ) -> Any:
         """Snapshot for analysis: *bar_count* closed bars (newest forming bar excluded)."""
+        cache = getattr(self._ctx, "market_data_cache", None)
+        cache_entry = None
+        if cache is not None:
+            try:
+                cache_entry = cache.get_latest(symbol=symbol, timeframe=timeframe)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("[analysis] chart cache lookup failed: %s", exc)
+
         try:
             if bars_raw is None:
+                if cache_entry is not None and cache_entry.has_enough_bars(min_bars=min(50, bar_count)):
+                    logger.info(
+                        "[analysis] using cached bars provider=%s bars=%s latest_bar=%s",
+                        cache_entry.provider,
+                        len(cache_entry.bars),
+                        cache_entry.latest_bar_time,
+                    )
+                    self._set_analysis_status(
+                        AnalysisStage.USING_CACHE,
+                        f"使用当前图表缓存构建快照，K线数：{len(cache_entry.bars)}",
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        bars_count=len(cache_entry.bars),
+                        provider=f"当前图表缓存 / {cache_entry.provider}",
+                    )
+                    bars_raw = list(cache_entry.bars)
+                else:
+                    logger.info("[analysis] checking latest chart cache: unavailable or not enough bars")
+                    self._set_analysis_status(
+                        AnalysisStage.FETCHING_SNAPSHOT,
+                        "当前缓存不足，正在重新获取行情快照…",
+                        symbol=symbol,
+                        timeframe=timeframe,
+                    )
                 data_source = getattr(self._ctx, "data_source", None)
-                if data_source is None or not getattr(data_source, "_connected", False):
+                if bars_raw is None and (data_source is None or not getattr(data_source, "_connected", False)):
                     return None
-                bars_raw = data_source.latest_snapshot(bar_count + 5)
+                if bars_raw is None:
+                    logger.info("[analysis] fetching snapshot from data source")
+                    try:
+                        bars_raw = data_source.latest_snapshot(bar_count + 5)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("[analysis] snapshot fetch failed, trying cached bars: %s", exc)
+                        if cache_entry is not None and cache_entry.has_enough_bars(min_bars=min(50, bar_count)):
+                            bars_raw = list(cache_entry.bars)
+                            self._set_analysis_status(
+                                AnalysisStage.WARNING,
+                                "实时重新获取行情失败，已使用当前图表缓存数据进行分析",
+                                symbol=symbol,
+                                timeframe=timeframe,
+                                bars_count=len(cache_entry.bars),
+                                provider=f"当前图表缓存 / {cache_entry.provider}",
+                                last_error=str(exc),
+                            )
+                        else:
+                            raise
             if not bars_raw:
                 return None
+            self._cache_latest_bars(bars_raw)
 
-            return self._build_chart_frame_from_bars(
+            frame = self._build_chart_frame_from_bars(
                 bars_raw,
                 bar_count=bar_count,
                 include_forming=False,
             )
+            if frame is not None:
+                provider = None
+                if cache_entry is not None and list(cache_entry.bars) == list(bars_raw):
+                    provider = f"当前图表缓存 / {cache_entry.provider}"
+                self._set_analysis_status(
+                    AnalysisStage.BUILDING_PROMPT,
+                    "行情快照已就绪，正在生成分析 Prompt…",
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    bars_count=len(frame.bars),
+                    provider=provider or getattr(getattr(self._ctx, "data_source", None), "last_provider", None),
+                )
+                logger.info("[analysis] building snapshot")
+            return frame
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Snapshot failed: %s", exc)
+            logger.warning("[analysis] failed at snapshot stage: %s", exc)
             return None
 
     def _make_kline_snapshot_fn(self) -> Any:

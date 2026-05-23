@@ -28,6 +28,7 @@ class GeneralSettings(BaseModel):
     refresh_interval_ms: int = 5000
     context_warning_threshold_pct: float = 80.0
     data_source_kind: Literal["akshare_a_share", "mt5"] = "akshare_a_share"
+    market_refresh_mode: Literal["review", "realtime"] = "review"
     market_data_use_proxy: bool = False
     market_data_timeout_sec: float = Field(default=8.0, ge=1.0, le=60.0)
     market_data_retry: int = Field(default=1, ge=1, le=5)
@@ -44,6 +45,7 @@ class GeneralSettings(BaseModel):
     stream_pane_font_pt: int = Field(default=11, ge=8, le=28)
     #: K 线图上 #序号 标签的字号（pt）
     chart_seq_label_font_pt: int = Field(default=7, ge=6, le=24)
+    range_analysis_max_bars: int = Field(default=500, ge=50, le=5000)
 
     @field_validator("decision_flow_default_zoom_pct", mode="before")
     @classmethod

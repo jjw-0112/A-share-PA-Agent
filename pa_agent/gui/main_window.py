@@ -3,12 +3,14 @@ from __future__ import annotations
 
 import logging
 import time
+from datetime import datetime
 from typing import Any
 
-from PyQt6.QtCore import QThread, QTimer, pyqtSignal, QObject
+from PyQt6.QtCore import QDateTime, QThread, QTimer, pyqtSignal, QObject
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QDateTimeEdit,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -34,6 +36,7 @@ from pa_agent.data.market_status import (
     DataStatusLevel,
     MarketDataStatus,
 )
+from pa_agent.data.market_request import MarketDataMode, MarketDataRequest
 from pa_agent.data.symbol_resolver import is_partial_symbol_input, resolve_symbol
 from pa_agent.gui.widgets.action_button import ActionButton
 from pa_agent.gui.widgets.status_panel import StatusPanel
@@ -144,10 +147,20 @@ class _AnalysisWorker(QThread):
             )
             decision = record.stage2_decision or {}
         except Exception as exc:  # noqa: BLE001
-            logger.error("Analysis worker error: %s", exc, exc_info=True)
-            decision = {}
-            record = None  # type: ignore[assignment]
-            self.error_occurred.emit(str(exc))
+            try:
+                from pa_agent.ai.deepseek_client import CancelledError
+            except Exception:  # noqa: BLE001
+                CancelledError = ()  # type: ignore[assignment]
+            if isinstance(exc, CancelledError) or self._cancel_token.is_set():
+                logger.info("Analysis worker cancelled")
+                decision = {}
+                record = None  # type: ignore[assignment]
+                self.status_update.emit("已取消")
+            else:
+                logger.error("Analysis worker error: %s", exc, exc_info=True)
+                decision = {}
+                record = None  # type: ignore[assignment]
+                self.error_occurred.emit(str(exc))
 
         if record is not None:
             self.record_ready.emit(record)
@@ -171,6 +184,9 @@ class MainWindow(QMainWindow):
         self._analysis_started_at = 0.0
         self._analysis_status: AnalysisStatus | None = None
         self._active_analysis_button: ActionButton | None = None
+        self._analysis_generation = 0
+        self._analysis_cancel_requested = False
+        self._last_snapshot_failure_message = ""
         self._switching = False
         self._symbol_apply_pending = False
         self._chart_refresh_paused = False
@@ -192,10 +208,20 @@ class MainWindow(QMainWindow):
         # RefreshLoop runs in its own QThread
         self._refresh_loop: Any = None
         self._refresh_thread: QThread | None = None
+        settings = getattr(self._ctx, "settings", None)
+        self._realtime_enabled = (
+            getattr(getattr(settings, "general", None), "market_refresh_mode", "review")
+            == "realtime"
+        )
         self._setup_ui()
         self._connect_event_bus()
-        self._start_refresh_loop()
+        if self._realtime_enabled and self._current_request_mode() == MarketDataMode.LATEST:
+            self._start_refresh_loop()
+        else:
+            self._realtime_enabled = False
+            QTimer.singleShot(0, lambda: self._refresh_chart_once(interactive=False))
         self._update_ai_mode_label()
+        self._sync_realtime_button_state()
         self._sync_submit_button_state()
 
     # ── UI construction ───────────────────────────────────────────────────────
@@ -337,6 +363,29 @@ class MainWindow(QMainWindow):
         self._bar_count_spin.setMinimumWidth(70)
         ctrl_layout.addWidget(self._bar_count_spin)
 
+        ctrl_layout.addWidget(QLabel("数据范围:"))
+        self._range_mode_combo = QComboBox()
+        self._range_mode_combo.addItem("最新K线", MarketDataMode.LATEST.value)
+        self._range_mode_combo.addItem("指定时间范围", MarketDataMode.RANGE.value)
+        self._range_mode_combo.setMinimumWidth(108)
+        ctrl_layout.addWidget(self._range_mode_combo)
+
+        now_dt = QDateTime.currentDateTime()
+        self._range_start_edit = QDateTimeEdit(now_dt.addMonths(-4))
+        self._range_start_edit.setDisplayFormat("yyyy-MM-dd HH:mm")
+        self._range_start_edit.setCalendarPopup(True)
+        self._range_start_edit.setMinimumWidth(138)
+        self._range_start_edit.setToolTip("指定时间范围模式下的开始时间")
+        ctrl_layout.addWidget(self._range_start_edit)
+
+        self._range_end_edit = QDateTimeEdit(now_dt)
+        self._range_end_edit.setDisplayFormat("yyyy-MM-dd HH:mm")
+        self._range_end_edit.setCalendarPopup(True)
+        self._range_end_edit.setMinimumWidth(138)
+        self._range_end_edit.setToolTip("指定时间范围模式下的结束时间")
+        ctrl_layout.addWidget(self._range_end_edit)
+        self._sync_range_controls()
+
         self._apply_market_btn = ActionButton("应用")
         self._apply_market_btn.setMinimumWidth(72)
         self._apply_market_btn.setToolTip("应用当前代码、周期和K线数量")
@@ -357,6 +406,7 @@ class MainWindow(QMainWindow):
         )
         self._wait_close_checkbox.stateChanged.connect(self._on_wait_close_checkbox_changed)
         ctrl_layout.addWidget(self._wait_close_checkbox)
+        self._sync_range_controls()
 
         self._wait_close_countdown_label = QLabel("")
         self._wait_close_countdown_label.setObjectName("mutedLabel")
@@ -368,6 +418,13 @@ class MainWindow(QMainWindow):
         self._submit_btn.setMinimumWidth(100)
         self._submit_btn.clicked.connect(self._on_submit_analysis)
         ctrl_layout.addWidget(self._submit_btn)
+
+        self._cancel_analysis_btn = ActionButton("取消分析")
+        self._cancel_analysis_btn.setMinimumWidth(88)
+        self._cancel_analysis_btn.setToolTip("取消当前正在进行的 AI 分析")
+        self._cancel_analysis_btn.clicked.connect(self._on_cancel_analysis)
+        self._cancel_analysis_btn.hide()
+        ctrl_layout.addWidget(self._cancel_analysis_btn)
 
         self._incremental_submit_btn = ActionButton("增量分析")
         self._incremental_submit_btn.setMinimumWidth(100)
@@ -384,11 +441,11 @@ class MainWindow(QMainWindow):
         self._demo_btn.clicked.connect(self._on_demo_mode_button)
         ctrl_layout.addWidget(self._demo_btn)
 
-        self._resume_chart_btn = QPushButton("图表实时更新")
-        self._resume_chart_btn.setEnabled(False)
-        self._resume_chart_btn.setToolTip("分析进行中会暂停图表刷新；分析开始后点此恢复 K 线实时更新")
-        self._resume_chart_btn.clicked.connect(self._on_resume_chart_refresh)
-        ctrl_layout.addWidget(self._resume_chart_btn)
+        self._realtime_toggle_btn = ActionButton("实时更新：关")
+        self._realtime_toggle_btn.setMinimumWidth(112)
+        self._realtime_toggle_btn.setToolTip("打开后按设置间隔自动刷新；复盘和指定时间范围默认关闭")
+        self._realtime_toggle_btn.clicked.connect(self._on_realtime_toggle_clicked)
+        ctrl_layout.addWidget(self._realtime_toggle_btn)
 
         self._fit_chart_btn = ActionButton("自适应")
         self._fit_chart_btn.setMinimumWidth(72)
@@ -460,6 +517,13 @@ class MainWindow(QMainWindow):
         self._bar_count_spin.valueChanged.connect(
             lambda _: self._schedule_symbol_apply("K线数已变更")
         )
+        self._range_mode_combo.currentIndexChanged.connect(self._on_range_mode_changed)
+        self._range_start_edit.dateTimeChanged.connect(
+            lambda _: self._schedule_symbol_apply("开始时间已变更")
+        )
+        self._range_end_edit.dateTimeChanged.connect(
+            lambda _: self._schedule_symbol_apply("结束时间已变更")
+        )
         line_edit = self._symbol_combo.lineEdit()
         if line_edit is not None:
             line_edit.returnPressed.connect(lambda: self._apply_symbol_controls(force=True))
@@ -475,8 +539,120 @@ class MainWindow(QMainWindow):
             return
         bus.status.connect(self._on_status_update)
 
+    def _current_request_mode(self) -> MarketDataMode:
+        combo = getattr(self, "_range_mode_combo", None)
+        if combo is None:
+            return MarketDataMode.LATEST
+        value = combo.currentData() or MarketDataMode.LATEST.value
+        return MarketDataMode.RANGE if value == MarketDataMode.RANGE.value else MarketDataMode.LATEST
+
+    def _range_datetimes(self) -> tuple[datetime | None, datetime | None]:
+        start_edit = getattr(self, "_range_start_edit", None)
+        end_edit = getattr(self, "_range_end_edit", None)
+        if start_edit is None or end_edit is None:
+            return None, None
+        start = start_edit.dateTime().toPyDateTime()
+        end = end_edit.dateTime().toPyDateTime()
+        return start, end
+
+    def _current_market_request(self) -> MarketDataRequest:
+        mode = self._current_request_mode()
+        start_at, end_at = self._range_datetimes()
+        return MarketDataRequest(
+            mode=mode,
+            symbol=self._symbol_combo.currentText().strip(),
+            timeframe=self._tf_combo.currentText(),
+            bar_count=int(self._bar_count_spin.value()),
+            start_at=start_at,
+            end_at=end_at,
+        )
+
+    def _sync_range_controls(self) -> None:
+        """Enable date controls only for explicit replay ranges."""
+        mode = self._current_request_mode()
+        is_range = mode == MarketDataMode.RANGE
+        if hasattr(self, "_bar_count_spin"):
+            self._bar_count_spin.setEnabled(not is_range)
+            self._bar_count_spin.setToolTip("指定时间范围模式下，K线数不参与请求" if is_range else "")
+        if hasattr(self, "_wait_close_checkbox"):
+            self._wait_close_checkbox.setEnabled(not is_range)
+            self._wait_close_checkbox.setToolTip(
+                "指定时间范围属于复盘模式，不等待实时K线收盘"
+                if is_range
+                else "勾选后，点击提交分析将先等待当前未收盘K线走完，再抓取数据并开始分析"
+            )
+        for edit_name in ("_range_start_edit", "_range_end_edit"):
+            edit = getattr(self, edit_name, None)
+            if edit is not None:
+                edit.setEnabled(is_range)
+
+    def _on_range_mode_changed(self, _index: int = 0) -> None:
+        """Switch between latest-bars and explicit replay range mode."""
+        self._sync_range_controls()
+        if self._current_request_mode() == MarketDataMode.RANGE and self._realtime_enabled:
+            self._set_realtime_enabled(False, persist=True, reason="时间范围为复盘模式，已关闭实时更新")
+        self._sync_realtime_button_state()
+        self._schedule_symbol_apply("数据范围已变更")
+
+    def _sync_realtime_button_state(self) -> None:
+        btn = getattr(self, "_realtime_toggle_btn", None)
+        if btn is None:
+            return
+        if self._current_request_mode() == MarketDataMode.RANGE:
+            btn.setEnabled(False)
+            btn.setText("实时更新：关")
+            btn.setToolTip("指定时间范围属于复盘模式，不启用实时更新")
+            return
+        btn.setEnabled(True)
+        btn.setText("实时更新：开" if self._realtime_enabled else "实时更新：关")
+        btn.setToolTip("点击关闭自动轮询" if self._realtime_enabled else "点击打开自动轮询")
+        btn.setProperty("state", "success" if self._realtime_enabled else "default")
+        btn.style().unpolish(btn)
+        btn.style().polish(btn)
+
+    def _persist_refresh_mode(self) -> None:
+        settings = getattr(self._ctx, "settings", None)
+        if settings is None:
+            return
+        settings.general.market_refresh_mode = "realtime" if self._realtime_enabled else "review"
+        try:
+            from pa_agent.config.settings import save_settings
+
+            save_settings(settings)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Failed to persist market_refresh_mode: %s", exc)
+
+    def _set_realtime_enabled(self, enabled: bool, *, persist: bool = True, reason: str = "") -> None:
+        """Turn background polling on/off. Manual refresh remains available."""
+        enabled = bool(enabled) and self._current_request_mode() == MarketDataMode.LATEST
+        if enabled == self._realtime_enabled and ((enabled and self._refresh_loop is not None) or not enabled):
+            self._sync_realtime_button_state()
+            return
+        self._realtime_enabled = enabled
+        if enabled:
+            self._start_refresh_loop()
+            if self._refresh_loop is None:
+                self._realtime_enabled = False
+                self._status_bar.showMessage("实时更新无法开启：行情源未连接")
+            else:
+                self._status_bar.showMessage(reason or "实时更新已开启")
+        else:
+            self._stop_refresh_loop()
+            self._status_bar.showMessage(reason or "实时更新已关闭，当前为复盘模式")
+        if persist:
+            self._persist_refresh_mode()
+        self._sync_realtime_button_state()
+
+    def _on_realtime_toggle_clicked(self) -> None:
+        if self._current_request_mode() == MarketDataMode.RANGE:
+            self._set_realtime_enabled(False, persist=True, reason="时间范围为复盘模式，不能开启实时更新")
+            return
+        self._set_realtime_enabled(not self._realtime_enabled, persist=True)
+
     def _start_refresh_loop(self) -> None:
         """Start the RefreshLoop only when the data source is connected."""
+        if self._refresh_loop is not None:
+            return
         data_source = getattr(self._ctx, "data_source", None)
         buffer = getattr(self._ctx, "buffer", None)
         if data_source is None or buffer is None:
@@ -498,6 +674,8 @@ class MainWindow(QMainWindow):
         if settings is not None:
             interval_ms = getattr(settings.general, "refresh_interval_ms", 1000)
             n_bars = getattr(settings.general, "default_bar_count", 200)
+        if hasattr(self, "_bar_count_spin"):
+            n_bars = int(self._bar_count_spin.value())
 
         self._refresh_cancel_token = CancelToken()
         self._refresh_loop = RefreshLoop(
@@ -539,6 +717,24 @@ class MainWindow(QMainWindow):
             return
         self._schedule_symbol_apply("代码已变更")
 
+    def _stop_refresh_loop(self) -> None:
+        """Stop the background market refresh thread if it is running."""
+        loop = getattr(self, "_refresh_loop", None)
+        token = getattr(self, "_refresh_cancel_token", None)
+        if token is not None:
+            token.set()
+        if loop is not None:
+            try:
+                loop.wait(2500)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("RefreshLoop wait failed: %s", exc)
+            try:
+                loop.deleteLater()
+            except Exception:  # noqa: BLE001
+                pass
+        self._refresh_loop = None
+        self._refresh_cancel_token = None
+
     def _is_partial_symbol_text(self, text: str) -> bool:
         """Return True for in-progress quote codes that should not switch yet."""
         raw = (text or "").strip()
@@ -578,6 +774,7 @@ class MainWindow(QMainWindow):
         symbol = self._symbol_combo.currentText().strip()
         timeframe = self._tf_combo.currentText()
         bar_count = int(self._bar_count_spin.value())
+        request = self._current_market_request()
         if not force and self._is_partial_symbol_text(symbol):
             self._set_market_status(
                 DataStatusLevel.IDLE,
@@ -591,7 +788,7 @@ class MainWindow(QMainWindow):
         if btn is not None:
             btn.set_loading("应用中…")
             logger.info("[ui] button=apply_market state=loading")
-        ok = self._on_symbol_or_tf_changed(symbol, timeframe, bar_count=bar_count)
+        ok = self._on_symbol_or_tf_changed(symbol, timeframe, bar_count=bar_count, request=request)
         if btn is not None:
             if ok:
                 btn.set_success("已应用")
@@ -661,6 +858,9 @@ class MainWindow(QMainWindow):
             if "阶段一分析中" in text or "阶段二分析中" in text:
                 logger.info("[analysis] calling LLM: %s", text)
                 stage = AnalysisStage.CALLING_LLM
+            elif "已取消" in text:
+                logger.info("[analysis] cancelled by user")
+                stage = AnalysisStage.CANCELLED
             elif "完成" in text:
                 logger.info("[analysis] LLM response received: %s", text)
                 stage = AnalysisStage.VALIDATING_JSON
@@ -702,6 +902,10 @@ class MainWindow(QMainWindow):
         latency_ms: int | None = None,
         last_error: str | None = None,
         warning: str | None = None,
+        mode: str = "latest",
+        start_at: Any = None,
+        end_at: Any = None,
+        oldest_bar_time: Any = None,
     ) -> None:
         """Set market status panel from UI-controlled events."""
         status = MarketDataStatus(
@@ -721,6 +925,10 @@ class MainWindow(QMainWindow):
             latency_ms=latency_ms,
             last_error=last_error,
             warning=warning,
+            mode=mode,
+            start_at=start_at,
+            end_at=end_at,
+            oldest_bar_time=oldest_bar_time,
         )
         panel = getattr(self, "_market_status_panel", None)
         if panel is not None:
@@ -762,9 +970,7 @@ class MainWindow(QMainWindow):
     def _set_chart_refresh_paused(self, paused: bool) -> None:
         """Pause or resume live chart updates from RefreshLoop."""
         self._chart_refresh_paused = paused
-        btn = getattr(self, "_resume_chart_btn", None)
-        if btn is not None:
-            btn.setEnabled(paused)
+        self._update_refresh_elapsed()
 
     def _on_resume_chart_refresh(self) -> None:
         """User requested live chart updates again."""
@@ -792,16 +998,35 @@ class MainWindow(QMainWindow):
                 last_error="行情源未连接",
             )
             return None
+        request = self._current_market_request()
         try:
-            n_bars = self._bar_count_spin.value() + 5
+            if request.mode == MarketDataMode.RANGE:
+                if request.start_at is None or request.end_at is None:
+                    raise ValueError("请先选择完整的开始/结束时间")
+                if request.start_at >= request.end_at:
+                    raise ValueError("开始时间必须早于结束时间")
+                fetch_message = "正在获取指定时间范围行情…"
+                request_bar_count = 0
+            else:
+                fetch_message = "正在获取行情…"
+                request_bar_count = self._bar_count_spin.value()
             self._set_market_status(
                 DataStatusLevel.FETCHING,
-                "正在获取行情…",
+                fetch_message,
                 raw_input=self._symbol_combo.currentText().strip(),
                 timeframe=self._tf_combo.currentText(),
-                bar_count=self._bar_count_spin.value(),
+                bar_count=request_bar_count,
+                mode=request.mode.value,
+                start_at=request.start_at,
+                end_at=request.end_at,
             )
-            bars = data_source.latest_snapshot(n_bars)
+            if request.mode == MarketDataMode.RANGE:
+                snapshot_range = getattr(data_source, "snapshot_range", None)
+                if not callable(snapshot_range):
+                    raise ValueError("当前行情源不支持指定时间范围")
+                bars = snapshot_range(request.start_at, request.end_at)
+            else:
+                bars = data_source.latest_snapshot(request.bar_count + 5)
             if not bars:
                 return None
             frame = self._build_chart_frame_from_bars(bars, include_forming=True)
@@ -815,7 +1040,10 @@ class MainWindow(QMainWindow):
                 "行情刷新失败，旧图表已保留",
                 raw_input=self._symbol_combo.currentText().strip(),
                 timeframe=self._tf_combo.currentText(),
-                bar_count=self._bar_count_spin.value(),
+                bar_count=0 if request.mode == MarketDataMode.RANGE else self._bar_count_spin.value(),
+                mode=request.mode.value,
+                start_at=request.start_at,
+                end_at=request.end_at,
                 provider=getattr(data_source, "last_provider", None),
                 last_error=str(exc),
             )
@@ -853,6 +1081,7 @@ class MainWindow(QMainWindow):
         resolved = getattr(data_source, "_resolved", None)
         raw = self._symbol_combo.currentText().strip()
         timeframe = self._tf_combo.currentText()
+        request = self._current_market_request()
         try:
             if resolved is None:
                 resolved = resolve_symbol(raw)
@@ -862,10 +1091,13 @@ class MainWindow(QMainWindow):
                 market=getattr(getattr(resolved, "market", None), "value", ""),
                 asset_type=getattr(getattr(resolved, "asset_type", None), "value", ""),
                 timeframe=timeframe,
-                requested_bar_count=self._bar_count_spin.value(),
+                requested_bar_count=len(bars) if request.mode == MarketDataMode.RANGE else self._bar_count_spin.value(),
                 bars=bars,
                 provider=getattr(data_source, "last_provider", None) or "chart-cache",
                 warning=getattr(data_source, "last_warning", None),
+                mode=request.mode.value,
+                start_at=request.start_at,
+                end_at=request.end_at,
             )
         except Exception as exc:  # noqa: BLE001
             logger.debug("latest bars cache update skipped: %s", exc)
@@ -923,14 +1155,19 @@ class MainWindow(QMainWindow):
             label.setStyleSheet("color: #e6b800; font-size: 11px;")
             return
         if self._last_refresh_ts == 0.0:
-            label.setText("距上次刷新: —")
+            label.setText("复盘模式，尚未刷新" if not self._realtime_enabled else "距上次刷新: —")
             return
         elapsed = int(_time.monotonic() - self._last_refresh_ts)
+        prefix = "实时更新" if self._realtime_enabled else "复盘模式"
         if elapsed < 60:
-            label.setText(f"距上次刷新: {elapsed}s")
+            label.setText(f"{prefix}，距上次刷新: {elapsed}s")
         else:
             m, s = divmod(elapsed, 60)
-            label.setText(f"距上次刷新: {m}m{s:02d}s")
+            label.setText(f"{prefix}，距上次刷新: {m}m{s:02d}s")
+        if not self._realtime_enabled:
+            label.setObjectName("mutedLabel")
+            label.setStyleSheet("")
+            return
         # Turn red if stale (> 10 seconds without update)
         if elapsed > 10:
             label.setStyleSheet("color: #f85149; font-size: 11px;")
@@ -978,6 +1215,7 @@ class MainWindow(QMainWindow):
         new_tf: str,
         *,
         bar_count: int | None = None,
+        request: MarketDataRequest | None = None,
     ) -> bool:
         """Validate and atomically switch symbol/timeframe without losing old chart."""
         if self._switching:
@@ -988,6 +1226,34 @@ class MainWindow(QMainWindow):
         self._switching = True
         try:
             bar_count = int(bar_count if bar_count is not None else self._bar_count_spin.value())
+            request = request or self._current_market_request()
+            if request.mode == MarketDataMode.RANGE:
+                if request.start_at is None or request.end_at is None:
+                    self._set_market_status(
+                        DataStatusLevel.ERROR,
+                        "请先选择完整的开始/结束时间",
+                        raw_input=new_symbol,
+                        timeframe=new_tf,
+                        bar_count=0,
+                        last_error="range start/end missing",
+                    )
+                    return False
+                if request.start_at >= request.end_at:
+                    self._set_market_status(
+                        DataStatusLevel.ERROR,
+                        "开始时间必须早于结束时间，旧图表已保留",
+                        raw_input=new_symbol,
+                        timeframe=new_tf,
+                        bar_count=0,
+                        last_error="start_at >= end_at",
+                    )
+                    return False
+                if self._realtime_enabled:
+                    self._set_realtime_enabled(
+                        False,
+                        persist=True,
+                        reason="时间范围为复盘模式，已关闭实时更新",
+                    )
             data_source = getattr(self._ctx, "data_source", None)
             buffer = getattr(self._ctx, "buffer", None)
             if data_source is None:
@@ -1018,14 +1284,21 @@ class MainWindow(QMainWindow):
 
             self._set_market_status(
                 DataStatusLevel.FETCHING,
-                f"正在切换到 {resolved.display_symbol} {new_tf}，请求 {bar_count} 根K线…",
+                (
+                    f"正在切换到 {resolved.display_symbol} {new_tf}，请求指定时间范围K线…"
+                    if request.mode == MarketDataMode.RANGE
+                    else f"正在切换到 {resolved.display_symbol} {new_tf}，请求 {bar_count} 根K线…"
+                ),
                 raw_input=new_symbol,
                 resolved_symbol=resolved.display_symbol,
                 market=resolved.market.value,
                 asset_type=resolved.asset_type.value,
                 timeframe=new_tf,
-                bar_count=bar_count,
+                bar_count=0 if request.mode == MarketDataMode.RANGE else bar_count,
                 warning=getattr(resolved, "warning", None),
+                mode=request.mode.value,
+                start_at=request.start_at,
+                end_at=request.end_at,
             )
 
             # ── Step 1: Cancel current AI worker after new controls are valid ──
@@ -1587,6 +1860,33 @@ class MainWindow(QMainWindow):
         """Handle the '增量分析' button click — always try incremental mode."""
         self._begin_submit_analysis(force_incremental=True)
 
+    def _on_cancel_analysis(self) -> None:
+        """Cancel the active AI analysis and close any in-flight HTTP request."""
+        if not self._analysis_in_progress:
+            return
+        logger.info("[analysis] cancel requested")
+        self._analysis_cancel_requested = True
+        if self._cancel_token is not None:
+            self._cancel_token.set()
+        client = getattr(self._ctx, "client", None)
+        cancel_requests = getattr(client, "cancel_active_requests", None)
+        if callable(cancel_requests):
+            try:
+                cancel_requests()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("cancel_active_requests failed: %s", exc)
+        btn = getattr(self, "_cancel_analysis_btn", None)
+        if isinstance(btn, ActionButton):
+            btn.set_loading("取消中…")
+            btn.show()
+        self._set_analysis_status(
+            AnalysisStage.CANCELLING,
+            "正在取消分析…",
+            symbol=self._symbol_combo.currentText().strip(),
+            timeframe=self._tf_combo.currentText(),
+        )
+        self._status_bar.showMessage("正在取消分析…")
+
     def _begin_submit_analysis(self, *, force_incremental: bool) -> None:
         """Shared entry for normal and forced-incremental submit buttons."""
         if not self._can_submit():
@@ -1603,7 +1903,7 @@ class MainWindow(QMainWindow):
         timeframe = self._tf_combo.currentText()
         bar_count = self._bar_count_spin.value()
 
-        if self._wait_close_checkbox.isChecked():
+        if self._wait_close_checkbox.isChecked() and self._current_request_mode() == MarketDataMode.LATEST:
             if not self._arm_wait_for_bar_close(
                 symbol,
                 timeframe,
@@ -1638,8 +1938,11 @@ class MainWindow(QMainWindow):
             bar_count,
             force_incremental,
         )
+        self._analysis_generation += 1
+        analysis_generation = self._analysis_generation
         self._analysis_started_at = time.monotonic()
         self._analysis_in_progress = True
+        self._analysis_cancel_requested = False
         self._last_analysis_had_error = False
         active_button = self._incremental_submit_btn if force_incremental else self._submit_btn
         self._active_analysis_button = active_button if isinstance(active_button, ActionButton) else None
@@ -1649,6 +1952,11 @@ class MainWindow(QMainWindow):
                 "[ui] button=%s state=loading",
                 "incremental_analysis" if force_incremental else "submit_analysis",
             )
+        cancel_btn = getattr(self, "_cancel_analysis_btn", None)
+        if isinstance(cancel_btn, ActionButton):
+            cancel_btn.reset_default("取消分析")
+            cancel_btn.show()
+            cancel_btn.setEnabled(True)
         self._sync_submit_button_state()
         self._set_analysis_status(
             AnalysisStage.PREPARING_SNAPSHOT,
@@ -1660,8 +1968,9 @@ class MainWindow(QMainWindow):
         frame = self._take_snapshot(symbol, timeframe, bar_count, bars_raw=snapshot_bars)
         if frame is None:
             self._fail_analysis_before_worker(
-                "行情快照获取失败，且没有可用图表缓存",
+                self._last_snapshot_failure_message or "行情快照获取失败，且没有可用图表缓存",
                 button=active_button,
+                show_message=bool(self._last_snapshot_failure_message),
             )
             return
 
@@ -1700,11 +2009,19 @@ class MainWindow(QMainWindow):
             incremental_new_bar_count=incremental_new_bar_count,
             parent=None,
         )
-        self._worker.finished.connect(self._on_analysis_finished)
-        self._worker.record_ready.connect(self._on_record_ready)
-        self._worker.error_occurred.connect(self._on_analysis_error)
-        self._worker.status_update.connect(self._on_status_update)
-        self._worker.finished.connect(lambda _: self._on_worker_done())
+        self._worker.finished.connect(
+            lambda decision, gen=analysis_generation: self._on_analysis_finished_for_generation(decision, gen)
+        )
+        self._worker.record_ready.connect(
+            lambda record, gen=analysis_generation: self._on_record_ready_for_generation(record, gen)
+        )
+        self._worker.error_occurred.connect(
+            lambda message, gen=analysis_generation: self._on_analysis_error_for_generation(message, gen)
+        )
+        self._worker.status_update.connect(
+            lambda text, gen=analysis_generation: self._on_status_update_for_generation(text, gen)
+        )
+        self._worker.finished.connect(lambda _, gen=analysis_generation: self._on_worker_done_for_generation(gen))
 
         panel = getattr(self, "_stream_panel", None)
         if panel is not None:
@@ -1794,6 +2111,9 @@ class MainWindow(QMainWindow):
         if isinstance(button, ActionButton):
             button.set_error("分析失败")
             logger.info("[ui] button=submit_analysis state=error")
+        cancel_btn = getattr(self, "_cancel_analysis_btn", None)
+        if isinstance(cancel_btn, ActionButton):
+            cancel_btn.hide()
         self._sync_submit_button_state()
         if show_message:
             QMessageBox.warning(self, "无法分析", message)
@@ -1897,6 +2217,47 @@ class MainWindow(QMainWindow):
 
         pf.set_stage2_files(stage2_prompt_txt_files(strategy_files))
         pf.set_extras(stage1_builtin=True, stage2_builtin=True)
+
+    def _is_current_analysis_generation(self, generation: int) -> bool:
+        return int(generation) == int(self._analysis_generation)
+
+    def _on_analysis_finished_for_generation(self, decision: dict, generation: int) -> None:
+        if not self._is_current_analysis_generation(generation):
+            logger.info("[analysis] discarded stale finished signal generation=%s", generation)
+            return
+        if self._analysis_cancel_requested:
+            return
+        self._on_analysis_finished(decision)
+
+    def _on_record_ready_for_generation(self, record: Any, generation: int) -> None:
+        if not self._is_current_analysis_generation(generation):
+            logger.info("[analysis] discarded stale record signal generation=%s", generation)
+            return
+        if self._analysis_cancel_requested:
+            return
+        self._on_record_ready(record)
+
+    def _on_analysis_error_for_generation(self, message: str, generation: int) -> None:
+        if not self._is_current_analysis_generation(generation):
+            logger.info("[analysis] discarded stale error signal generation=%s", generation)
+            return
+        if self._analysis_cancel_requested:
+            logger.info("[analysis] ignored worker error after cancellation: %s", message)
+            return
+        self._on_analysis_error(message)
+
+    def _on_status_update_for_generation(self, text: str, generation: int) -> None:
+        if not self._is_current_analysis_generation(generation):
+            return
+        if self._analysis_cancel_requested and text != "已取消":
+            return
+        self._on_status_update(text)
+
+    def _on_worker_done_for_generation(self, generation: int) -> None:
+        if not self._is_current_analysis_generation(generation):
+            logger.info("[analysis] discarded stale worker-done signal generation=%s", generation)
+            return
+        self._on_worker_done()
 
     def _on_analysis_finished(self, decision: dict) -> None:
         """Called on the main thread when the AI worker completes.
@@ -2248,6 +2609,27 @@ class MainWindow(QMainWindow):
         """Reset in-progress flag and re-enable the submit button."""
         self._analysis_in_progress = False
         self._worker = None
+        cancel_btn = getattr(self, "_cancel_analysis_btn", None)
+        if self._analysis_cancel_requested:
+            self._status_bar.showMessage("分析已取消")
+            self._set_analysis_status(
+                AnalysisStage.CANCELLED,
+                "分析已取消",
+                symbol=self._symbol_combo.currentText().strip(),
+                timeframe=self._tf_combo.currentText(),
+            )
+            if isinstance(cancel_btn, ActionButton):
+                cancel_btn.set_success("已取消", reset_after_ms=900)
+                QTimer.singleShot(950, cancel_btn.hide)
+            for button in (self._submit_btn, self._incremental_submit_btn):
+                if isinstance(button, ActionButton):
+                    button.reset_default()
+            self._active_analysis_button = None
+            self._analysis_cancel_requested = False
+            if self._realtime_enabled:
+                self._set_chart_refresh_paused(False)
+            logger.info("[analysis] cancelled")
+            return
         if self._last_analysis_had_error:
             self._status_bar.showMessage("分析结束（存在错误，请查看「原始」页调试信息）")
             self._set_analysis_status(
@@ -2282,7 +2664,11 @@ class MainWindow(QMainWindow):
                     other.reset_default()
             logger.info("[analysis] completed")
         self._active_analysis_button = None
+        if isinstance(cancel_btn, ActionButton):
+            cancel_btn.hide()
         self._update_submit_button_state()
+        if self._realtime_enabled:
+            self._set_chart_refresh_paused(False)
 
     def _open_settings_dialog(self) -> None:
         """Open the SettingsDialog; import lazily to avoid circular imports."""
@@ -2358,6 +2744,19 @@ class MainWindow(QMainWindow):
                 f"模型: {p.model} · 思考={('开' if p.thinking else '关')}"
             )
 
+    def closeEvent(self, event: Any) -> None:  # noqa: N802 - Qt API
+        """Stop background work before the window closes."""
+        try:
+            self._stop_refresh_loop()
+            if self._analysis_in_progress and self._cancel_token is not None:
+                self._cancel_token.set()
+                client = getattr(self._ctx, "client", None)
+                cancel_requests = getattr(client, "cancel_active_requests", None)
+                if callable(cancel_requests):
+                    cancel_requests()
+        finally:
+            super().closeEvent(event)
+
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _can_submit(self) -> bool:
@@ -2383,6 +2782,14 @@ class MainWindow(QMainWindow):
         reason = self._submit_block_reason()
         can = reason is None
         self._submit_btn.setEnabled(can)
+        cancel_btn = getattr(self, "_cancel_analysis_btn", None)
+        if isinstance(cancel_btn, ActionButton):
+            if self._analysis_in_progress:
+                cancel_btn.show()
+                if not self._analysis_cancel_requested:
+                    cancel_btn.setEnabled(True)
+            else:
+                cancel_btn.hide()
         if hasattr(self, "_incremental_submit_btn"):
             self._incremental_submit_btn.setEnabled(can)
             if can:
@@ -2426,6 +2833,11 @@ class MainWindow(QMainWindow):
         timeframe = self._tf_combo.currentText()
         if not bars_raw:
             return None
+        if self._current_request_mode() == MarketDataMode.RANGE and bar_count is None:
+            if include_forming and getattr(bars_raw[0], "closed", True) is False:
+                n = max(1, len(bars_raw) - 1)
+            else:
+                n = len(bars_raw)
         if include_forming:
             return build_live_frame(bars_raw, n, symbol, timeframe)
         return build_display_frame(bars_raw, n, symbol, timeframe)
@@ -2439,17 +2851,26 @@ class MainWindow(QMainWindow):
         bars_raw: Any = None,
     ) -> Any:
         """Snapshot for analysis: *bar_count* closed bars (newest forming bar excluded)."""
+        self._last_snapshot_failure_message = ""
+        request = self._current_market_request()
+        min_required = 50 if request.mode == MarketDataMode.RANGE else min(50, bar_count)
         cache = getattr(self._ctx, "market_data_cache", None)
         cache_entry = None
         if cache is not None:
             try:
-                cache_entry = cache.get_latest(symbol=symbol, timeframe=timeframe)
+                cache_entry = cache.get_latest(
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    mode=request.mode.value,
+                    start_at=request.start_at,
+                    end_at=request.end_at,
+                )
             except Exception as exc:  # noqa: BLE001
                 logger.debug("[analysis] chart cache lookup failed: %s", exc)
 
         try:
             if bars_raw is None:
-                if cache_entry is not None and cache_entry.has_enough_bars(min_bars=min(50, bar_count)):
+                if cache_entry is not None and cache_entry.has_enough_bars(min_bars=min_required):
                     logger.info(
                         "[analysis] using cached bars provider=%s bars=%s latest_bar=%s",
                         cache_entry.provider,
@@ -2479,10 +2900,18 @@ class MainWindow(QMainWindow):
                 if bars_raw is None:
                     logger.info("[analysis] fetching snapshot from data source")
                     try:
-                        bars_raw = data_source.latest_snapshot(bar_count + 5)
+                        if request.mode == MarketDataMode.RANGE:
+                            snapshot_range = getattr(data_source, "snapshot_range", None)
+                            if not callable(snapshot_range):
+                                raise ValueError("当前行情源不支持指定时间范围")
+                            if request.start_at is None or request.end_at is None:
+                                raise ValueError("请先选择完整的开始/结束时间")
+                            bars_raw = snapshot_range(request.start_at, request.end_at)
+                        else:
+                            bars_raw = data_source.latest_snapshot(bar_count + 5)
                     except Exception as exc:  # noqa: BLE001
                         logger.warning("[analysis] snapshot fetch failed, trying cached bars: %s", exc)
-                        if cache_entry is not None and cache_entry.has_enough_bars(min_bars=min(50, bar_count)):
+                        if cache_entry is not None and cache_entry.has_enough_bars(min_bars=min_required):
                             bars_raw = list(cache_entry.bars)
                             self._set_analysis_status(
                                 AnalysisStage.WARNING,
@@ -2499,9 +2928,31 @@ class MainWindow(QMainWindow):
                 return None
             self._cache_latest_bars(bars_raw)
 
+            if request.mode == MarketDataMode.RANGE:
+                closed_count = sum(1 for bar in bars_raw if getattr(bar, "closed", True))
+                settings = getattr(self._ctx, "settings", None)
+                max_bars = int(
+                    getattr(getattr(settings, "general", None), "range_analysis_max_bars", 500)
+                    or 500
+                )
+                if closed_count > max_bars:
+                    self._last_snapshot_failure_message = (
+                        f"当前时间范围内有 {closed_count} 根已收盘K线，超过 AI 分析上限 {max_bars} 根。"
+                        "请缩短时间范围或切回最新K线模式。"
+                    )
+                    return None
+                if closed_count < min_required:
+                    self._last_snapshot_failure_message = (
+                        f"范围内K线不足：仅 {closed_count} 根已收盘K线，至少需要 {min_required} 根。"
+                    )
+                    return None
+                analysis_bar_count = closed_count
+            else:
+                analysis_bar_count = bar_count
+
             frame = self._build_chart_frame_from_bars(
                 bars_raw,
-                bar_count=bar_count,
+                bar_count=analysis_bar_count,
                 include_forming=False,
             )
             if frame is not None:

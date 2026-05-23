@@ -21,6 +21,9 @@ def hk_fetch_attempts(
     period: str,
     start_date: str,
     end_date: str,
+    *,
+    minute_start: str | None = None,
+    minute_end: str | None = None,
 ) -> list[tuple[str, Any, dict[str, Any]]]:
     """Return ordered HK provider attempts as (provider, function, kwargs)."""
     if resolved.asset_type == AssetType.INDEX:
@@ -44,8 +47,8 @@ def hk_fetch_attempts(
                 {
                     "symbol": resolved.code,
                     "period": period,
-                    "start_date": _minute_start_date(),
-                    "end_date": _minute_end_date(),
+                    "start_date": minute_start or _minute_start_date(),
+                    "end_date": minute_end or _minute_end_date(),
                     "adjust": "",
                 },
             ),

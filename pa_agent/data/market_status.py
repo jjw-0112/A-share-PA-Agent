@@ -35,6 +35,10 @@ class MarketDataStatus:
     warning: str | None = None
     request_id: int | None = None
     generation_id: int | None = None
+    mode: str = "latest"
+    start_at: datetime | None = None
+    end_at: datetime | None = None
+    oldest_bar_time: datetime | None = None
 
 
 class AnalysisStage(str, Enum):
@@ -49,6 +53,8 @@ class AnalysisStage(str, Enum):
     SUCCESS = "success"
     WARNING = "warning"
     ERROR = "error"
+    CANCELLING = "cancelling"
+    CANCELLED = "cancelled"
 
 
 @dataclass(frozen=True, slots=True)

@@ -31,17 +31,24 @@ class StatusPanel(QFrame):
     def set_market_status(self, status: MarketDataStatus) -> None:
         self.setProperty("level", status.level.value)
         latest = status.latest_bar_time.strftime("%Y-%m-%d %H:%M") if status.latest_bar_time else "—"
+        oldest = status.oldest_bar_time.strftime("%Y-%m-%d %H:%M") if status.oldest_bar_time else "—"
+        start = status.start_at.strftime("%Y-%m-%d %H:%M") if status.start_at else "—"
+        end = status.end_at.strftime("%Y-%m-%d %H:%M") if status.end_at else "—"
         success = status.last_success_at.strftime("%H:%M:%S") if status.last_success_at else "—"
+        mode_label = "指定时间范围" if status.mode == "range" else "最新K线"
         bits = [
             f"状态：{status.message or status.level.value}",
+            f"模式：{mode_label}",
             f"输入：{status.raw_input or '—'}",
             f"解析：{status.resolved_symbol or '—'}",
             f"市场/类型：{status.market or '—'} / {status.asset_type or '—'}",
             f"周期/K线数：{status.timeframe or '—'} / {status.bar_count or '—'}",
+            f"范围：{start} → {end}" if status.mode == "range" else "",
             f"数据源：{status.provider or '—'}",
-            f"返回：{status.bars_returned if status.bars_returned is not None else '—'} 根，最新：{latest}",
+            f"返回：{status.bars_returned if status.bars_returned is not None else '—'} 根，最新：{latest}，最早：{oldest}",
             f"耗时：{status.latency_ms if status.latency_ms is not None else '—'} ms，最近成功：{success}",
         ]
+        bits = [bit for bit in bits if bit]
         if status.warning:
             bits.append(f"提示：{status.warning}")
         if status.last_error:
@@ -73,7 +80,7 @@ class StatusPanel(QFrame):
 
 
 def _analysis_level(stage: AnalysisStage) -> str:
-    if stage in (AnalysisStage.SUCCESS,):
+    if stage in (AnalysisStage.SUCCESS, AnalysisStage.CANCELLED):
         return DataStatusLevel.SUCCESS.value
     if stage in (AnalysisStage.WARNING,):
         return DataStatusLevel.WARNING.value

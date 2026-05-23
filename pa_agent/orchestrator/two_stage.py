@@ -378,6 +378,14 @@ class TwoStageOrchestrator:
                 reasoning_effort=_effort,
             )
         except Exception as exc:
+            from pa_agent.ai.deepseek_client import CancelledError
+
+            if isinstance(exc, CancelledError) or cancel_token.is_set():
+                logger.info("Stage 1 cancelled by user: %s", exc)
+                record = record.model_copy(update={"stage1_messages": messages_s1})
+                self._pending_writer.save_partial(record, "user_cancelled")
+                on_event(OrchestratorEvent.Cancelled)
+                return record
             if self._is_network_error(exc):
                 logger.warning("Stage 1 network error: %s", exc)
                 record = record.model_copy(
@@ -583,6 +591,27 @@ class TwoStageOrchestrator:
                 reasoning_effort=_effort,
             )
         except Exception as exc:
+            from pa_agent.ai.deepseek_client import CancelledError
+
+            if isinstance(exc, CancelledError) or cancel_token.is_set():
+                logger.info("Stage 2 cancelled by user: %s", exc)
+                record = record.model_copy(
+                    update={
+                        "stage1_messages": messages_s1,
+                        "stage1_response": reply_s1.raw,
+                        "stage1_diagnosis": stage1_json,
+                        "stage2_messages": messages_s2,
+                        "strategy_files_used": strategy_files,
+                        "experience_loaded": [
+                            e.model_dump() if hasattr(e, "model_dump") else dict(e)
+                            for e in experience_entries
+                        ],
+                        "usage_total": _accumulate_usage(record.usage_total, reply_s1.usage),
+                    }
+                )
+                self._pending_writer.save_partial(record, "user_cancelled")
+                on_event(OrchestratorEvent.Cancelled)
+                return record
             if self._is_network_error(exc):
                 logger.warning("Stage 2 network error: %s", exc)
                 record = record.model_copy(

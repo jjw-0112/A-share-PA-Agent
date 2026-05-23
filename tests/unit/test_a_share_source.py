@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sys
+from datetime import datetime
 from types import SimpleNamespace
 
 import pandas as pd
@@ -178,3 +179,41 @@ def test_hk_stock_daily_route(monkeypatch: pytest.MonkeyPatch) -> None:
     src.subscribe("600519", "1m")
     with pytest.raises(DataSourceTransientError):
         src.latest_snapshot(2)
+
+
+def test_snapshot_range_fetches_all_rows_and_filters_dates(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[dict] = []
+
+    def stock_zh_a_hist(**kwargs):
+        calls.append(kwargs)
+        return pd.DataFrame(
+            {
+                "日期": ["2025-12-31", "2026-01-02", "2026-01-05", "2026-01-06"],
+                "开盘": [9.0, 10.0, 10.5, 11.0],
+                "最高": [9.5, 10.6, 10.8, 11.5],
+                "最低": [8.8, 9.8, 10.2, 10.8],
+                "收盘": [9.2, 10.4, 10.7, 11.2],
+                "成交量": [900, 1000, 1100, 1200],
+            }
+        )
+
+    src = _connected_source(monkeypatch, SimpleNamespace(stock_zh_a_hist=stock_zh_a_hist))
+    src.subscribe("000006", "1d")
+    bars = src.snapshot_range(datetime(2026, 1, 1), datetime(2026, 1, 5, 23, 59))
+
+    assert calls[0]["start_date"] == "20260101"
+    assert calls[0]["end_date"] == "20260105"
+    assert len(bars) == 2
+    assert bars[0].seq == 1
+    assert bars[0].close == pytest.approx(10.7)
+    assert bars[1].close == pytest.approx(10.4)
+    assert src.last_status.mode == "range"
+    assert src.last_status.bars_returned == 2
+
+
+def test_snapshot_range_rejects_reversed_time(monkeypatch: pytest.MonkeyPatch) -> None:
+    src = _connected_source(monkeypatch, SimpleNamespace(stock_zh_a_hist=lambda **_: _sample_df()))
+    src.subscribe("000006", "1d")
+
+    with pytest.raises(DataSourceTransientError, match="开始时间"):
+        src.snapshot_range(datetime(2026, 5, 2), datetime(2026, 5, 1))

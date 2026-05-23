@@ -4,6 +4,7 @@ from __future__ import annotations
 import importlib.util
 import logging
 import os
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, TYPE_CHECKING
@@ -260,6 +261,29 @@ class DeepSeekClient:
     def __init__(self, settings: AIProviderSettings, logger_: logging.Logger | None = None) -> None:
         self._settings = settings
         self._log = logger_ or logger
+        self._client_lock = threading.Lock()
+        self._active_clients: set[Any] = set()
+
+    def cancel_active_requests(self) -> None:
+        """Close active OpenAI HTTP clients to unblock in-flight AI requests."""
+        with self._client_lock:
+            clients = list(self._active_clients)
+            self._active_clients.clear()
+        for client in clients:
+            close = getattr(client, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception as exc:  # noqa: BLE001
+                    self._log.debug("OpenAI client close during cancel failed: %s", exc)
+
+    def _register_client(self, client: Any) -> None:
+        with self._client_lock:
+            self._active_clients.add(client)
+
+    def _unregister_client(self, client: Any) -> None:
+        with self._client_lock:
+            self._active_clients.discard(client)
 
     def chat(
         self,
@@ -312,6 +336,8 @@ class DeepSeekClient:
             base_url=self._settings.base_url,
             api_key=self._settings.api_key,
         )
+        self._register_client(client)
+        self._register_client(client)
 
         t0 = time.monotonic()
         create_kwargs: dict[str, Any] = {
@@ -325,15 +351,26 @@ class DeepSeekClient:
         if _effort is not None:
             create_kwargs["reasoning_effort"] = _effort
         try:
-            response = client.chat.completions.create(
-                **create_kwargs,
-                # IMPORTANT: do NOT add temperature, top_p, presence_penalty,
-                # frequency_penalty — they are incompatible with thinking mode.
-            )
-        except Exception as exc:
-            latency_ms = (time.monotonic() - t0) * 1000
-            self._log.error("DeepSeekClient API error after %.0f ms: %s", latency_ms, exc)
-            raise
+            try:
+                response = client.chat.completions.create(
+                    **create_kwargs,
+                    # IMPORTANT: do NOT add temperature, top_p, presence_penalty,
+                    # frequency_penalty — they are incompatible with thinking mode.
+                )
+            except Exception as exc:
+                latency_ms = (time.monotonic() - t0) * 1000
+                if cancel_token is not None and cancel_token.is_set():
+                    raise CancelledError("Request cancelled during API call") from exc
+                self._log.error("DeepSeekClient API error after %.0f ms: %s", latency_ms, exc)
+                raise
+        finally:
+            self._unregister_client(client)
+            close = getattr(client, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
 
         latency_ms = (time.monotonic() - t0) * 1000
 
@@ -521,8 +558,18 @@ class DeepSeekClient:
             raise
         except Exception as exc:
             latency_ms = (time.monotonic() - t0) * 1000
+            if cancel_token is not None and cancel_token.is_set():
+                raise CancelledError("Request cancelled during streaming") from exc
             self._log.error("DeepSeekClient stream error after %.0f ms: %s", latency_ms, exc)
             raise
+        finally:
+            self._unregister_client(client)
+            close = getattr(client, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
 
         latency_ms = (time.monotonic() - t0) * 1000
 

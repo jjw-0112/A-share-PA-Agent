@@ -108,7 +108,7 @@ class AShareSource(DataSource):
         self._connected: bool = False
         self._ak: Any = None
         self._cache_ttl_seconds = float(cache_ttl_seconds)
-        self._cache: dict[tuple[str, str, int, int], tuple[float, list[KlineBar]]] = {}
+        self._cache: dict[tuple[Any, ...], tuple[float, list[KlineBar]]] = {}
         self._use_proxy = bool(use_proxy)
         self._timeout_sec = float(timeout_sec)
         self._retry = max(1, int(retry))
@@ -215,7 +215,7 @@ class AShareSource(DataSource):
         generation_id = self._generation_id
         resolved = self._resolved
         timeframe = self._timeframe
-        cache_key = (resolved.display_symbol, timeframe, int(n), generation_id)
+        cache_key = ("latest", resolved.display_symbol, timeframe, int(n), generation_id)
         now_mono = time.monotonic()
         cached = self._cache.get(cache_key)
         if cached and now_mono - cached[0] < self._cache_ttl_seconds:
@@ -227,6 +227,7 @@ class AShareSource(DataSource):
             resolved=resolved,
             timeframe=timeframe,
             bar_count=int(n),
+            mode="latest",
             message=f"正在获取 {resolved.display_symbol} {timeframe} 行情...",
             request_id=request_id,
             generation_id=generation_id,
@@ -242,7 +243,15 @@ class AShareSource(DataSource):
         )
         t0 = time.monotonic()
         try:
-            result = self._fetch_dataframe_with_fallback(self._ak, resolved, timeframe, int(n), request_id, generation_id)
+            result = self._fetch_dataframe_with_fallback(
+                self._ak,
+                resolved,
+                timeframe,
+                int(n),
+                request_id,
+                generation_id,
+                mode="latest",
+            )
             if generation_id != self._generation_id:
                 raise _StaleMarketDataError("stale market data result discarded")
             norm_df = _normalize_ohlcv(result.df)
@@ -266,6 +275,7 @@ class AShareSource(DataSource):
                 resolved=resolved,
                 timeframe=timeframe,
                 bar_count=int(n),
+                mode="latest",
                 message="行情获取失败",
                 provider=self.last_provider,
                 latency_ms=int((time.monotonic() - t0) * 1000),
@@ -285,6 +295,7 @@ class AShareSource(DataSource):
                 resolved=resolved,
                 timeframe=timeframe,
                 bar_count=int(n),
+                mode="latest",
                 message="行情获取失败",
                 provider=self.last_provider,
                 latency_ms=int((time.monotonic() - t0) * 1000),
@@ -302,16 +313,19 @@ class AShareSource(DataSource):
         self._cache[cache_key] = (now_mono, list(bars))
         level = DataStatusLevel.WARNING if result.warning else DataStatusLevel.SUCCESS
         latest_dt = _bar_dt(bars[0])
+        oldest_dt = _bar_dt(bars[-1])
         self._set_status(
             level,
             raw_input=resolved.raw_input,
             resolved=resolved,
             timeframe=timeframe,
             bar_count=int(n),
+            mode="latest",
             provider=result.provider,
             message=f"获取成功，返回 {len(bars)} 根K线",
             bars_returned=len(bars),
             latest_bar_time=latest_dt,
+            oldest_bar_time=oldest_dt,
             latency_ms=int((time.monotonic() - t0) * 1000),
             warning=result.warning,
             request_id=request_id,
@@ -330,16 +344,194 @@ class AShareSource(DataSource):
         )
         return bars
 
+    def snapshot_range(self, start_at: datetime, end_at: datetime) -> list[KlineBar]:
+        """Fetch all bars within an explicit local time range."""
+        if not self._connected or self._ak is None:
+            raise DataSourceTransientError("Not connected - call connect() first")
+        if not self._resolved or not self._timeframe:
+            raise DataSourceTransientError("Not subscribed - call subscribe() first")
+
+        start_dt = _coerce_cn_datetime(start_at)
+        end_dt = _coerce_cn_datetime(end_at)
+        if start_dt >= end_dt:
+            raise DataSourceTransientError("开始时间必须早于结束时间")
+
+        request_id = self._next_request_id()
+        generation_id = self._generation_id
+        resolved = self._resolved
+        timeframe = self._timeframe
+        cache_key = (
+            "range",
+            resolved.display_symbol,
+            timeframe,
+            int(start_dt.timestamp()),
+            int(end_dt.timestamp()),
+            generation_id,
+        )
+        now_mono = time.monotonic()
+        cached = self._cache.get(cache_key)
+        if cached and now_mono - cached[0] < self._cache_ttl_seconds:
+            return list(cached[1])
+
+        self._set_status(
+            DataStatusLevel.FETCHING,
+            raw_input=resolved.raw_input,
+            resolved=resolved,
+            timeframe=timeframe,
+            bar_count=0,
+            mode="range",
+            start_at=start_dt,
+            end_at=end_dt,
+            message=f"正在获取 {resolved.display_symbol} {timeframe} 指定时间范围行情...",
+            request_id=request_id,
+            generation_id=generation_id,
+        )
+        logger.info(
+            "[market-data request_id=%s generation=%s symbol=%s tf=%s range=%s..%s] fetching",
+            request_id,
+            generation_id,
+            resolved.display_symbol,
+            timeframe,
+            start_dt,
+            end_dt,
+        )
+        t0 = time.monotonic()
+        try:
+            result = self._fetch_dataframe_with_fallback(
+                self._ak,
+                resolved,
+                timeframe,
+                None,
+                request_id,
+                generation_id,
+                mode="range",
+                start_at=start_dt,
+                end_at=end_dt,
+            )
+            if generation_id != self._generation_id:
+                raise _StaleMarketDataError("stale market data result discarded")
+            norm_df = _normalize_ohlcv(result.df)
+            if timeframe in ("1w", "1M"):
+                norm_df = _resample_normalized_index(norm_df, timeframe)
+            norm_df = _filter_normalized_range(norm_df, start_dt, end_dt)
+            bars = _build_bars(norm_df, timeframe, max(len(norm_df), 1))
+        except _StaleMarketDataError:
+            logger.info(
+                "[market-data request_id=%s generation=%s symbol=%s tf=%s] stale range result discarded",
+                request_id,
+                generation_id,
+                resolved.display_symbol,
+                timeframe,
+            )
+            raise
+        except DataSourceTransientError as exc:
+            self._error_count += 1
+            self._set_status(
+                DataStatusLevel.ERROR,
+                raw_input=resolved.raw_input,
+                resolved=resolved,
+                timeframe=timeframe,
+                bar_count=0,
+                mode="range",
+                start_at=start_dt,
+                end_at=end_dt,
+                message="行情范围获取失败",
+                provider=self.last_provider,
+                latency_ms=int((time.monotonic() - t0) * 1000),
+                last_error=str(exc),
+                request_id=request_id,
+                generation_id=generation_id,
+            )
+            raise
+        except Exception as exc:  # noqa: BLE001
+            self._error_count += 1
+            wrapped = DataSourceTransientError(
+                f"AKShare range fetch failed for {resolved.display_symbol} {timeframe}: {exc}"
+            )
+            self._set_status(
+                DataStatusLevel.ERROR,
+                raw_input=resolved.raw_input,
+                resolved=resolved,
+                timeframe=timeframe,
+                bar_count=0,
+                mode="range",
+                start_at=start_dt,
+                end_at=end_dt,
+                message="行情范围获取失败",
+                provider=self.last_provider,
+                latency_ms=int((time.monotonic() - t0) * 1000),
+                last_error=str(wrapped),
+                request_id=request_id,
+                generation_id=generation_id,
+            )
+            raise wrapped from exc
+
+        if not bars:
+            raise DataSourceTransientError(
+                f"指定时间范围内没有可用K线：{resolved.display_symbol} {timeframe}"
+            )
+
+        self.last_provider = result.provider
+        self.last_warning = result.warning
+        self._cache[cache_key] = (now_mono, list(bars))
+        level = DataStatusLevel.WARNING if result.warning else DataStatusLevel.SUCCESS
+        latest_dt = _bar_dt(bars[0])
+        oldest_dt = _bar_dt(bars[-1])
+        self._set_status(
+            level,
+            raw_input=resolved.raw_input,
+            resolved=resolved,
+            timeframe=timeframe,
+            bar_count=len(bars),
+            mode="range",
+            start_at=start_dt,
+            end_at=end_dt,
+            provider=result.provider,
+            message=f"获取成功，范围内返回 {len(bars)} 根K线",
+            bars_returned=len(bars),
+            latest_bar_time=latest_dt,
+            oldest_bar_time=oldest_dt,
+            latency_ms=int((time.monotonic() - t0) * 1000),
+            warning=result.warning,
+            request_id=request_id,
+            generation_id=generation_id,
+            last_success_at=datetime.now(),
+        )
+        logger.info(
+            "[market-data request_id=%s generation=%s provider=%s symbol=%s tf=%s] range success bars=%s oldest=%s latest=%s",
+            request_id,
+            generation_id,
+            result.provider,
+            resolved.display_symbol,
+            timeframe,
+            len(bars),
+            oldest_dt,
+            latest_dt,
+        )
+        return bars
+
     def _fetch_dataframe_with_fallback(
         self,
         ak: Any,
         resolved: ResolvedSymbol,
         timeframe: str,
-        n: int,
+        n: int | None,
         request_id: int,
         generation_id: int,
+        *,
+        mode: str = "latest",
+        start_at: datetime | None = None,
+        end_at: datetime | None = None,
     ) -> DataProviderResult:
-        attempts = self._provider_attempts(ak, resolved, timeframe, n)
+        attempts = self._provider_attempts(
+            ak,
+            resolved,
+            timeframe,
+            n,
+            mode=mode,
+            start_at=start_at,
+            end_at=end_at,
+        )
         failures: list[str] = []
         for provider, func, kwargs in attempts:
             if generation_id != self._generation_id:
@@ -381,17 +573,49 @@ class AShareSource(DataSource):
         ak: Any,
         resolved: ResolvedSymbol,
         timeframe: str,
-        n: int,
+        n: int | None,
+        *,
+        mode: str = "latest",
+        start_at: datetime | None = None,
+        end_at: datetime | None = None,
     ) -> list[tuple[str, Any, dict[str, Any]]]:
         now = datetime.now(CN_TZ)
-        start_date = (now - timedelta(days=365 * 8)).strftime("%Y%m%d")
-        end_date = now.strftime("%Y%m%d")
+        if mode == "range" and start_at is not None and end_at is not None:
+            start_dt = _coerce_cn_datetime(start_at)
+            end_dt = _coerce_cn_datetime(end_at)
+            start_date = start_dt.strftime("%Y%m%d")
+            end_date = end_dt.strftime("%Y%m%d")
+            minute_start = start_dt.strftime("%Y-%m-%d %H:%M:%S")
+            minute_end = end_dt.strftime("%Y-%m-%d %H:%M:%S")
+        else:
+            start_dt = None
+            end_dt = None
+            start_date = (now - timedelta(days=365 * 8)).strftime("%Y%m%d")
+            end_date = now.strftime("%Y%m%d")
+            minute_start = None
+            minute_end = None
         if resolved.market == Market.HK:
             period = _MINUTE_TF_MAP.get(timeframe) or _DAILY_TF_MAP[timeframe]
-            return hk_fetch_attempts(ak, resolved, timeframe, period, start_date, end_date)
+            return hk_fetch_attempts(
+                ak,
+                resolved,
+                timeframe,
+                period,
+                start_date,
+                end_date,
+                minute_start=minute_start,
+                minute_end=minute_end,
+            )
 
         if timeframe in _MINUTE_TF_MAP:
-            return _cn_minute_attempts(ak, resolved, timeframe, n)
+            return _cn_minute_attempts(
+                ak,
+                resolved,
+                timeframe,
+                n or 200,
+                start_at=start_dt,
+                end_at=end_dt,
+            )
         return _cn_period_attempts(ak, resolved, timeframe, start_date, end_date)
 
     def _next_request_id(self) -> int:
@@ -410,12 +634,16 @@ class AShareSource(DataSource):
         message: str = "",
         bars_returned: int | None = None,
         latest_bar_time: datetime | None = None,
+        oldest_bar_time: datetime | None = None,
         latency_ms: int | None = None,
         warning: str | None = None,
         last_error: str | None = None,
         request_id: int | None = None,
         generation_id: int | None = None,
         last_success_at: datetime | None = None,
+        mode: str = "latest",
+        start_at: datetime | None = None,
+        end_at: datetime | None = None,
     ) -> None:
         self.last_status = MarketDataStatus(
             level=level,
@@ -437,6 +665,10 @@ class AShareSource(DataSource):
             warning=warning,
             request_id=request_id,
             generation_id=generation_id,
+            mode=mode,
+            start_at=start_at,
+            end_at=end_at,
+            oldest_bar_time=oldest_bar_time,
         )
 
 
@@ -445,12 +677,23 @@ def _cn_minute_attempts(
     resolved: ResolvedSymbol,
     timeframe: str,
     n: int,
+    *,
+    start_at: datetime | None = None,
+    end_at: datetime | None = None,
 ) -> list[tuple[str, Any, dict[str, Any]]]:
     period = _MINUTE_TF_MAP[timeframe]
     now = datetime.now(CN_TZ)
-    lookback_days = max(10, min(180, int(n / 48) + 10))
-    start = (now - timedelta(days=lookback_days)).strftime("%Y-%m-%d 09:30:00")
-    end = (now + timedelta(days=1)).strftime("%Y-%m-%d 15:00:00")
+    if start_at is not None and end_at is not None:
+        start = _coerce_cn_datetime(start_at).strftime("%Y-%m-%d %H:%M:%S")
+        end = _coerce_cn_datetime(end_at).strftime("%Y-%m-%d %H:%M:%S")
+        index_start_date = _coerce_cn_datetime(start_at).strftime("%Y%m%d")
+        index_end_date = _coerce_cn_datetime(end_at).strftime("%Y%m%d")
+    else:
+        lookback_days = max(10, min(180, int(n / 48) + 10))
+        start = (now - timedelta(days=lookback_days)).strftime("%Y-%m-%d 09:30:00")
+        end = (now + timedelta(days=1)).strftime("%Y-%m-%d 15:00:00")
+        index_start_date = (now - timedelta(days=365 * 3)).strftime("%Y%m%d")
+        index_end_date = now.strftime("%Y%m%d")
     if resolved.asset_type == AssetType.STOCK:
         return [
             ("eastmoney-stock-minute", getattr(ak, "stock_zh_a_hist_min_em", None), {"symbol": resolved.code, "period": period, "start_date": start, "end_date": end, "adjust": ""}),
@@ -463,7 +706,7 @@ def _cn_minute_attempts(
         ]
     return [
         ("eastmoney-index-minute", getattr(ak, "index_zh_a_hist_min_em", None), {"symbol": resolved.code, "period": period, "start_date": start, "end_date": end}),
-        ("akshare-index-daily-fallback", getattr(ak, "index_zh_a_hist", None), {"symbol": resolved.code, "period": "daily", "start_date": (now - timedelta(days=365 * 3)).strftime("%Y%m%d"), "end_date": now.strftime("%Y%m%d")}),
+        ("akshare-index-daily-fallback", getattr(ak, "index_zh_a_hist", None), {"symbol": resolved.code, "period": "daily", "start_date": index_start_date, "end_date": index_end_date}),
     ]
 
 
@@ -577,6 +820,22 @@ def _build_bars(df: Any, timeframe: str, n: int) -> list[KlineBar]:
             )
         )
     return bars
+
+
+def _filter_normalized_range(df: Any, start_at: datetime, end_at: datetime) -> Any:
+    start_dt = _coerce_cn_datetime(start_at).replace(tzinfo=None)
+    end_dt = _coerce_cn_datetime(end_at).replace(tzinfo=None)
+    mask = (df["ts"] >= start_dt) & (df["ts"] <= end_dt)
+    filtered = df.loc[mask].copy()
+    if filtered.empty:
+        raise DataSourceTransientError("指定时间范围内没有可用K线")
+    return filtered
+
+
+def _coerce_cn_datetime(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=CN_TZ)
+    return value.astimezone(CN_TZ)
 
 
 def _pick_col(df: Any, *names: str) -> Any | None:

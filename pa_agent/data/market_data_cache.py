@@ -21,6 +21,9 @@ class LatestBarsCache:
     fetched_at: datetime
     latest_bar_time: datetime | None
     warning: str | None = None
+    mode: str = "latest"
+    start_at: datetime | None = None
+    end_at: datetime | None = None
 
     def has_enough_bars(self, min_bars: int = 50) -> bool:
         closed_count = sum(1 for bar in self.bars if bar.closed)
@@ -45,6 +48,9 @@ class MarketDataCache:
         bars: Sequence[KlineBar],
         provider: str,
         warning: str | None = None,
+        mode: str = "latest",
+        start_at: datetime | None = None,
+        end_at: datetime | None = None,
     ) -> LatestBarsCache:
         latest = _latest_bar_time(bars)
         entry = LatestBarsCache(
@@ -59,6 +65,9 @@ class MarketDataCache:
             fetched_at=datetime.now(),
             latest_bar_time=latest,
             warning=warning,
+            mode=mode,
+            start_at=start_at,
+            end_at=end_at,
         )
         self._latest = entry
         return entry
@@ -68,12 +77,22 @@ class MarketDataCache:
         *,
         symbol: str | None = None,
         timeframe: str | None = None,
+        mode: str | None = None,
+        start_at: datetime | None = None,
+        end_at: datetime | None = None,
     ) -> LatestBarsCache | None:
         entry = self._latest
         if entry is None:
             return None
         if timeframe is not None and entry.timeframe != timeframe:
             return None
+        if mode is not None and entry.mode != mode:
+            return None
+        if mode == "range":
+            if start_at is not None and entry.start_at != start_at:
+                return None
+            if end_at is not None and entry.end_at != end_at:
+                return None
         if symbol is not None and symbol not in {
             entry.raw_input,
             entry.resolved_symbol,

@@ -10,7 +10,11 @@ from pa_agent.ai.deepseek_client import (
     AIReply,
     AIUsage,
     CancelledError,
+    _PROXY_ENV_VARS,
+    _SOCKS_PROXY_MISSING_MESSAGE,
+    _configured_socks_proxy_env,
     _completion_max_tokens,
+    _ensure_socks_proxy_dependency,
 )
 
 
@@ -38,6 +42,29 @@ def _make_mock_response(content: str = "hello", reasoning: str = "thinking...") 
     resp.id = "req-abc123"
     resp.model = "deepseek-v4-pro"
     return resp
+
+
+def _clear_proxy_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for env_name in _PROXY_ENV_VARS:
+        monkeypatch.delenv(env_name, raising=False)
+
+
+def test_configured_socks_proxy_env_detects_socks_proxy(monkeypatch):
+    _clear_proxy_env(monkeypatch)
+    monkeypatch.setenv("HTTPS_PROXY", "socks5://127.0.0.1:1080")
+
+    assert _configured_socks_proxy_env() == "HTTPS_PROXY"
+
+
+def test_ensure_socks_proxy_dependency_has_friendly_error(monkeypatch):
+    _clear_proxy_env(monkeypatch)
+    monkeypatch.setenv("ALL_PROXY", "socks5h://127.0.0.1:1080")
+
+    with patch("pa_agent.ai.deepseek_client.importlib.util.find_spec", return_value=None):
+        with pytest.raises(RuntimeError, match="SOCKS 代理"):
+            _ensure_socks_proxy_dependency()
+
+    assert "httpx[socks]" in _SOCKS_PROXY_MISSING_MESSAGE
 
 
 def test_chat_does_not_send_forbidden_params():

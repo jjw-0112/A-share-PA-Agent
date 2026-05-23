@@ -38,6 +38,12 @@ VALID_STAGE2_NO_ORDER = {
         "risk_assessment": "观望",
         "invalidation_condition": None,
     },
+    "a_share": {
+        "action_type": "no_action",
+        "watch_levels": [],
+        "position_note": "未提供持仓信息，减仓/防守仅适用于已有持仓者",
+        "constraints": ["不输出开空计划", "不要求用户输入持仓", "不计算仓位数量"],
+    },
     "diagnosis_summary": {
         "cycle_position": "trading_range",
         "direction": "neutral",

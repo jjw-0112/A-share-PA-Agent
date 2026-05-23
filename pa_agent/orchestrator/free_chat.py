@@ -163,7 +163,7 @@ class FreeChatSession:
                     "   - 只围绕持仓管理回答，不要重新跑完整下单决策。\n"
                     "   - 先给结论（可以/不建议/条件允许），再给依据（结构/关键位/信号），再给风险控制（最大亏损、触发条件）。\n"
                     "3) 如果用户问题信息不足，最多问 1-2 个澄清点（例如仓位大小、入场价、止损距离）。\n"
-                    "4) 不要编造数据；以“最新已收盘K线数据”为准。\n"
+                    "4) 不要编造数据；以用户消息附带的「当前图表K线数据」为准（与发送追问时屏幕上冻结的图表一致）。\n"
                 ),
             }
         )
@@ -202,7 +202,8 @@ class FreeChatSession:
                 kline_table = self._kline_snapshot_fn()
                 if kline_table:
                     user_content = (
-                        f"## 最新已收盘K线数据\n\n{kline_table}\n\n"
+                        "## 当前图表K线数据（发送追问时已刷新并冻结图表，与屏幕一致）\n\n"
+                        f"{kline_table}\n\n"
                         f"---\n\n{user_text}"
                     )
             except Exception as exc:  # noqa: BLE001

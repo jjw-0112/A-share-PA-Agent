@@ -37,8 +37,9 @@ class IndicatorBundle:
 class KlineFrame:
     """Immutable snapshot of N bars plus computed indicators.
 
-    bars[0] is the newest bar (seq=1, closed=False).
-    bars[-1] is the oldest bar (seq=N, closed=True).
+    bars[0] is the newest bar (seq=1). It may be forming or closed depending
+    on market/session state and the frame builder used.
+    bars[-1] is the oldest bar (seq=N).
     snapshot_ts_local_ms is the local machine time when the snapshot was taken.
     """
     symbol: str
@@ -61,7 +62,7 @@ class DataSourceTransientError(DataSourceError):
 class DataSource(ABC):
     """Abstract interface for K-line data providers.
 
-    Implementations: TradingViewSource (active), MT5Source (stub).
+    Implementations: AShareSource, MT5Source, TradingViewSource.
     """
 
     @abstractmethod

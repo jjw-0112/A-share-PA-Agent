@@ -35,6 +35,9 @@ class KlineBuffer:
             if self._forming is not None and self._forming.ts_open == bar.ts_open:
                 # The forming bar just closed — replace it
                 self._forming = None
+            if self._closed and self._closed[0].ts_open == bar.ts_open:
+                self._closed[0] = bar
+                return
             # Insert at front (newest-first)
             self._closed.appendleft(bar)
             # Trim to capacity

@@ -13,6 +13,15 @@ from pa_agent.ai.trace_normalize import (
 from tests.integration.conftest import VALID_STAGE2
 
 
+def _a_share_no_action() -> dict:
+    return {
+        "action_type": "no_action",
+        "watch_levels": [],
+        "position_note": "未提供持仓信息，减仓/防守仅适用于已有持仓者",
+        "constraints": ["不输出开空计划", "不要求用户输入持仓", "不计算仓位数量"],
+    }
+
+
 def test_fix_reversed_bar_range() -> None:
     assert fix_bar_range_string("K1-K4") == "K4-K1"
     assert fix_bar_range_string("K50-K1") == "K50-K1"
@@ -80,6 +89,7 @@ def test_validator_accepts_user_trending_tr_trace() -> None:
                 "take_profit_price": None,
                 "stop_loss_price": None,
             },
+            "a_share": _a_share_no_action(),
             "decision_trace": [
                 {
                     "node_id": "6.2",
@@ -165,6 +175,7 @@ def test_validator_accepts_user_payload_with_null_bar_ranges() -> None:
                 "take_profit_price": None,
                 "stop_loss_price": None,
             },
+            "a_share": _a_share_no_action(),
             "decision_trace": [
                 {
                     "node_id": "4.2",
@@ -214,6 +225,7 @@ def test_validator_accepts_normalized_user_stage2_snippet() -> None:
                 "take_profit_price": None,
                 "stop_loss_price": None,
             },
+            "a_share": _a_share_no_action(),
             "decision_trace": [
                 {
                     "node_id": "4.2",
@@ -314,6 +326,7 @@ def test_validator_accepts_partial_and_pending_answers() -> None:
                 "take_profit_price": None,
                 "stop_loss_price": None,
             },
+            "a_share": _a_share_no_action(),
             "decision_trace": [
                 {
                     "node_id": "9.2",
@@ -356,6 +369,7 @@ def test_validator_accepts_stage2_with_null_bar_range_and_forbid_phrase() -> Non
                 "take_profit_price": None,
                 "stop_loss_price": None,
             },
+            "a_share": _a_share_no_action(),
             "decision_trace": [
                 {
                     "node_id": "9.3",

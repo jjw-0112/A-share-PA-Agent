@@ -17,6 +17,36 @@ _STRATEGY_FILE_ALIASES: dict[str, str] = {
     "宽通道交易策略.txt": "文件13-窄通道与宽通道策略.txt",
 }
 
+_BAR_ROLE_ALIASES: dict[str, str] = {
+    "continue": "confirmation",
+    "continued": "confirmation",
+    "continuation": "confirmation",
+    "follow": "confirmation",
+    "follow_through": "confirmation",
+    "follow-through": "confirmation",
+    "confirm": "confirmation",
+    "confirmed": "confirmation",
+    "reversal": "signal",
+    "breakout": "signal",
+    "setup": "signal",
+    "pullback": "test",
+    "retest": "test",
+    "failure": "trap",
+    "failed": "trap",
+    "exhaustion": "climax",
+    "延续": "confirmation",
+    "跟随": "confirmation",
+    "确认": "confirmation",
+    "结构": "structure",
+    "信号": "signal",
+    "入场": "entry",
+    "噪音": "noise",
+    "噪声": "noise",
+    "陷阱": "trap",
+    "高潮": "climax",
+    "测试": "test",
+}
+
 
 def _normalize_strategy_file_names(files: Any) -> list[str]:
     if not isinstance(files, list):
@@ -29,6 +59,23 @@ def _normalize_strategy_file_names(files: Any) -> list[str]:
         if name and name not in out:
             out.append(name)
     return out
+
+
+def _normalize_bar_by_bar_roles(out: dict[str, Any]) -> None:
+    summary = out.get("bar_by_bar_summary")
+    if not isinstance(summary, list):
+        return
+    for item in summary:
+        if not isinstance(item, dict):
+            continue
+        role = item.get("role")
+        if not isinstance(role, str):
+            continue
+        key = role.strip().lower()
+        normalized = _BAR_ROLE_ALIASES.get(key)
+        if normalized:
+            item["role"] = normalized
+            logger.debug("Mapped bar_by_bar_summary role %r -> %s", role, normalized)
 
 
 def normalize_stage1(obj: dict[str, Any]) -> dict[str, Any]:
@@ -55,5 +102,6 @@ def normalize_stage1(obj: dict[str, Any]) -> dict[str, Any]:
         )
 
     normalize_stage1_traces(out)
+    _normalize_bar_by_bar_roles(out)
 
     return out

@@ -152,7 +152,7 @@ class MainWindow(QMainWindow):
     def __init__(self, ctx: AppContext, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("PA Agent — Trading Terminal")
-        self.resize(1440, 900)
+        self.resize(1500, 860)
         self._ctx = ctx
         self._worker: _AnalysisWorker | None = None
         self._cancel_token: Any = None
@@ -250,23 +250,36 @@ class MainWindow(QMainWindow):
         ctrl_layout = QHBoxLayout()
         ctrl_layout.setSpacing(8)
 
-        # Symbol — editable combo (user can type any MT5 symbol)
-        ctrl_layout.addWidget(QLabel("品种:"))
+        # Symbol - editable combo (user can type A-share stock/ETF/index codes)
+        ctrl_layout.addWidget(QLabel("A股代码:"))
         self._symbol_combo = QComboBox()
         self._symbol_combo.setEditable(True)
-        self._symbol_combo.addItems(
-            ["XAUUSDm", "XAUUSD", "EURUSD", "GBPUSD", "USDJPY", "USDCHF", "XAGUSD"]
+        data_source = getattr(self._ctx, "data_source", None)
+        default_symbols = (
+            data_source.list_symbols()
+            if data_source is not None and callable(getattr(data_source, "list_symbols", None))
+            else [
+                "STOCK:600519",
+                "STOCK:300750",
+                "STOCK:000001",
+                "ETF:510300",
+                "ETF:159915",
+                "INDEX:sh000001",
+                "INDEX:sz399001",
+                "INDEX:sz399006",
+            ]
         )
+        self._symbol_combo.addItems(default_symbols)
         # Restore last-used symbol from settings
-        _last_symbol = "XAUUSDm"
+        _last_symbol = "STOCK:600519"
         _last_tf = "15m"
         _settings = getattr(self._ctx, "settings", None)
         if _settings is not None:
-            _last_symbol = getattr(_settings.general, "last_symbol", "XAUUSDm") or "XAUUSDm"
+            _last_symbol = getattr(_settings.general, "last_symbol", "STOCK:600519") or "STOCK:600519"
             _last_tf = getattr(_settings.general, "last_timeframe", "15m") or "15m"
         self._symbol_combo.setCurrentText(_last_symbol)
         self._symbol_combo.setMinimumWidth(110)
-        self._symbol_combo.lineEdit().setPlaceholderText("输入品种名…")
+        self._symbol_combo.lineEdit().setPlaceholderText("输入代码，如 600519 / ETF:510300 / INDEX:sh000001")
         ctrl_layout.addWidget(self._symbol_combo)
 
         self._symbol_alert_label = QLabel("")
@@ -278,7 +291,14 @@ class MainWindow(QMainWindow):
         # Timeframe
         ctrl_layout.addWidget(QLabel("周期:"))
         self._tf_combo = QComboBox()
-        self._tf_combo.addItems(["1m", "5m", "15m", "1h", "4h", "1d"])
+        supported_timeframes = (
+            data_source.supported_timeframes()
+            if data_source is not None and callable(getattr(data_source, "supported_timeframes", None))
+            else ["1m", "5m", "15m", "30m", "1h", "1d", "1w", "1M"]
+        )
+        self._tf_combo.addItems(supported_timeframes)
+        if _last_tf not in supported_timeframes:
+            _last_tf = "15m"
         self._tf_combo.setCurrentText(_last_tf)
         self._tf_combo.setMinimumWidth(60)
         ctrl_layout.addWidget(self._tf_combo)
@@ -333,6 +353,11 @@ class MainWindow(QMainWindow):
         self._resume_chart_btn.clicked.connect(self._on_resume_chart_refresh)
         ctrl_layout.addWidget(self._resume_chart_btn)
 
+        self._fit_chart_btn = QPushButton("自适应")
+        self._fit_chart_btn.setMinimumWidth(72)
+        self._fit_chart_btn.setToolTip("恢复完整K线视图，并按当前窗口自动适配价格轴")
+        ctrl_layout.addWidget(self._fit_chart_btn)
+
         self._decision_badge = QLabel("")
         self._decision_badge.setObjectName("mutedLabel")
         ctrl_layout.addWidget(self._decision_badge)
@@ -364,13 +389,16 @@ class MainWindow(QMainWindow):
         self._chart_widget.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
         )
+        self._fit_chart_btn.clicked.connect(self._chart_widget.fit_to_data)
+        self._apply_chart_display_settings()
         workbench.addWidget(self._chart_widget)
 
         self._ai_sidebar.setMinimumWidth(400)
         workbench.addWidget(self._ai_sidebar)
 
-        workbench.setStretchFactor(0, 3)
+        workbench.setStretchFactor(0, 5)
         workbench.setStretchFactor(1, 2)
+        workbench.setSizes([1080, 420])
 
         outer_layout.addWidget(workbench, stretch=1)
 
@@ -402,7 +430,7 @@ class MainWindow(QMainWindow):
         # Don't start if the data source hasn't connected yet
         if not getattr(data_source, "_connected", False):
             logger.info("Data source not connected — RefreshLoop deferred.")
-            self._status_bar.showMessage("数据源未连接，请检查网络后重启程序")
+            self._status_bar.showMessage("A股公开行情源未连接，请检查网络或稍后重试")
             return
 
         from pa_agent.data.refresh_loop import RefreshLoop
@@ -445,7 +473,7 @@ class MainWindow(QMainWindow):
         )
 
     def _update_symbol_mt5_alert(self) -> None:
-        """Show a red hint when the typed symbol is not available in MT5."""
+        """Show a hint when the typed symbol cannot be parsed by the data source."""
         label = getattr(self, "_symbol_alert_label", None)
         if label is None:
             return
@@ -462,15 +490,15 @@ class MainWindow(QMainWindow):
             label.hide()
             return
         label.setText(
-            "未在 MT5 获取到该品种，请检查当前输入是否与 MT5「市场报价」中的名称完全一致"
-            "（含后缀，如 XAUUSDm）。"
+            "未识别该A股标的。可输入 600519、STOCK:600519、ETF:510300 "
+            "或 INDEX:sh000001。"
         )
         label.show()
 
     def _on_status_update(self, text: str) -> None:
         """Update the status bar with subscription / analysis / data-delay text."""
         self._status_bar.showMessage(text)
-        if text == "数据延迟":
+        if text in ("数据延迟", "非连续竞价时段/等待下一根K线"):
             self._update_symbol_mt5_alert()
         if self._analysis_in_progress:
             panel = getattr(self, "_stream_panel", None)
@@ -494,16 +522,45 @@ class MainWindow(QMainWindow):
 
     def _refresh_chart_once(self) -> None:
         """Apply one immediate chart refresh (e.g. after resuming)."""
+        self._pull_chart_frame_from_source()
+
+    def _pull_chart_frame_from_source(self) -> Any:
+        """Fetch latest bars from the active data source and return the chart display frame."""
         data_source = getattr(self._ctx, "data_source", None)
         if data_source is None or not getattr(data_source, "_connected", False):
-            return
+            return None
         try:
             n_bars = self._bar_count_spin.value() + 5
             bars = data_source.latest_snapshot(n_bars)
-            if bars:
-                self._on_refresh_frame_ready(bars)
+            if not bars:
+                return None
+            return self._build_chart_frame_from_bars(bars, include_forming=True)
         except Exception as exc:  # noqa: BLE001
-            logger.debug("Immediate chart refresh failed: %s", exc)
+            logger.debug("Chart frame pull failed: %s", exc)
+            return None
+
+    def snapshot_klines_for_followup(self) -> str:
+        """Refresh chart once, freeze updates, return K-line table matching the chart."""
+        import time as _time
+
+        from pa_agent.ai.prompt_assembler import PromptAssembler
+
+        frame = self._pull_chart_frame_from_source()
+        chart = getattr(self, "_chart_widget", None)
+        if frame is not None and chart is not None:
+            chart.set_frame_now(frame)
+            self._last_refresh_ts = _time.monotonic()
+        elif chart is not None:
+            frame = chart.displayed_frame()
+
+        self._set_chart_refresh_paused(True)
+        self._update_refresh_elapsed()
+        if getattr(self, "_status_bar", None) is not None:
+            self._status_bar.showMessage("追问：已刷新并冻结图表，K线与屏幕一致")
+
+        if frame is None:
+            return ""
+        return PromptAssembler._render_kline_table(frame)
 
     def _update_refresh_elapsed(self) -> None:
         """Update the 'distance from last refresh' label every second."""
@@ -531,7 +588,7 @@ class MainWindow(QMainWindow):
             label.setStyleSheet("color: #58a6ff; font-size: 11px;")
             return
         if self._chart_refresh_paused:
-            label.setText("图表刷新已暂停（分析中）")
+            label.setText("图表刷新已暂停")
             label.setStyleSheet("color: #e6b800; font-size: 11px;")
             return
         if self._last_refresh_ts == 0.0:
@@ -727,6 +784,8 @@ class MainWindow(QMainWindow):
             ts = current_forming_ts(bars)
             if ts is not None:
                 self._last_forming_ts_open = ts
+            else:
+                self._last_forming_ts_open = None
         except Exception as exc:  # noqa: BLE001
             logger.debug("refresh_last_forming_ts failed: %s", exc)
 
@@ -835,7 +894,7 @@ class MainWindow(QMainWindow):
 
         data_source = getattr(self._ctx, "data_source", None)
         if data_source is None or not getattr(data_source, "_connected", False):
-            self._status_bar.showMessage("数据源未连接")
+            self._status_bar.showMessage("A股公开行情源未连接")
             return False
 
         try:
@@ -851,8 +910,15 @@ class MainWindow(QMainWindow):
 
         forming_ts = current_forming_ts(bars_raw)
         if forming_ts is None:
-            self._status_bar.showMessage("无法识别当前K线")
-            return False
+            self._status_bar.showMessage("当前不在连续竞价形成中K线，直接使用最新已收盘K线分析")
+            self._start_analysis(
+                symbol,
+                timeframe,
+                bar_count,
+                force_incremental=force_incremental,
+                snapshot_bars=bars_raw,
+            )
+            return True
 
         self._pending_submit_after_close = True
         self._pending_force_incremental = force_incremental
@@ -1435,6 +1501,7 @@ class MainWindow(QMainWindow):
                 diagnosis_summary=decision.get("diagnosis_summary"),
                 stage1_diagnosis=self._last_stage1_diagnosis,
                 decision_stance=stance,
+                a_share=decision.get("a_share"),
             )
             self._bind_decision_tree(decision, self._last_stage1_diagnosis)
             order = inner.get("order_type", "—")
@@ -1579,6 +1646,7 @@ class MainWindow(QMainWindow):
                 diagnosis_summary=s2_full.get("diagnosis_summary"),
                 stage1_diagnosis=s1_diag if isinstance(s1_diag, dict) else None,
                 decision_stance=stance,
+                a_share=s2_full.get("a_share"),
             )
             self._bind_decision_tree(
                 s2_full,
@@ -1771,7 +1839,18 @@ class MainWindow(QMainWindow):
                 key = getattr(settings.provider, "api_key", "") or ""
                 self._debug_widget._api_key = key
                 self._ai_sidebar.bind_settings(settings)
+                self._apply_chart_display_settings()
             self._update_ai_mode_label()
+
+    def _apply_chart_display_settings(self) -> None:
+        """Sync chart label font sizes from persisted general settings."""
+        chart = getattr(self, "_chart_widget", None)
+        settings = getattr(self._ctx, "settings", None)
+        if chart is None or settings is None:
+            return
+        chart.set_seq_label_font_pt(
+            int(getattr(settings.general, "chart_seq_label_font_pt", 7) or 7)
+        )
 
     def _update_ai_mode_label(self) -> None:
         """Show current thinking / reasoning_effort / model in the toolbar."""
@@ -1911,23 +1990,10 @@ class MainWindow(QMainWindow):
             return None
 
     def _make_kline_snapshot_fn(self) -> Any:
-        """Return a callable that captures the latest closed K-line data as a text table.
-
-        The returned function reads from the live data source at call time,
-        so FreeChatSession always gets the most recent market data when the
-        user sends a follow-up message.
-        """
-        from pa_agent.ai.prompt_assembler import PromptAssembler
-
-        symbol = self._symbol_combo.currentText()
-        timeframe = self._tf_combo.currentText()
-        bar_count = self._bar_count_spin.value()
+        """Return a callable that refreshes/freeze chart then exports its K-line table."""
 
         def _snapshot() -> str:
-            frame = self._take_snapshot(symbol, timeframe, bar_count)
-            if frame is None:
-                return ""
-            return PromptAssembler._render_kline_table(frame)
+            return self.snapshot_klines_for_followup()
 
         return _snapshot
 

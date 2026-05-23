@@ -24,6 +24,22 @@ from PyQt6.QtWidgets import (
 
 _NO_ORDER = "不下单"
 
+_A_SHARE_ACTION_ZH: dict[str, str] = {
+    "analysis_only": "结构分析",
+    "long_watch": "观察买点",
+    "long_plan": "条件买入计划",
+    "risk_warning": "风险/减仓提示",
+    "no_action": "无操作",
+}
+
+_A_SHARE_ACTION_COLOR: dict[str, str] = {
+    "analysis_only": "#8b949e",
+    "long_watch": "#58a6ff",
+    "long_plan": "#3fb950",
+    "risk_warning": "#f85149",
+    "no_action": "#8b949e",
+}
+
 # Brooks cycle_position → 中文（市场周期 / 频谱位置）
 _CYCLE_POSITION_ZH: dict[str, str] = {
     "spike": "尖峰 (Spike)",
@@ -105,6 +121,15 @@ def _parse_score_100(value: object) -> int | None:
         return max(0, min(100, int(float(str(value).strip()))))
     except (ValueError, TypeError):
         return None
+
+
+def _format_watch_price(value: object) -> str:
+    if value is None or value == "":
+        return "—"
+    try:
+        return f"{float(value):.5g}"
+    except (TypeError, ValueError):
+        return str(value)
 
 
 class DecisionPanel(QWidget):
@@ -239,6 +264,32 @@ class DecisionPanel(QWidget):
             details_layout.addWidget(lbl)
 
         layout.addWidget(self._details_widget)
+
+        # ── A股观察位 ─────────────────────────────────────────────────────
+        self._a_share_widget = QWidget()
+        a_share_layout = QVBoxLayout(self._a_share_widget)
+        a_share_layout.setContentsMargins(0, 2, 0, 2)
+        a_share_layout.setSpacing(5)
+
+        a_share_title = QLabel("A股观察位")
+        a_share_title.setStyleSheet("font-weight: bold; color: #58a6ff;")
+        a_share_layout.addWidget(a_share_title)
+
+        self._a_share_action_label = QLabel()
+        self._a_share_levels_label = QLabel()
+        self._a_share_position_label = QLabel()
+        self._a_share_constraints_label = QLabel()
+        for lbl in (
+            self._a_share_action_label,
+            self._a_share_levels_label,
+            self._a_share_position_label,
+            self._a_share_constraints_label,
+        ):
+            lbl.setWordWrap(True)
+            lbl.setObjectName("mutedLabel")
+            a_share_layout.addWidget(lbl)
+
+        layout.addWidget(self._a_share_widget)
 
         # ── 交易决策置信度（来自 Stage 2 trade_confidence）────────────────
         self._trade_conf_title = QLabel("交易决策置信度")
@@ -399,6 +450,51 @@ class DecisionPanel(QWidget):
         self._rr_inline_label.setVisible(False)
         self._win_rate_inline_label.setVisible(False)
 
+    def _apply_a_share(self, a_share: dict | None) -> tuple[str | None, str]:
+        """Render A-share observation levels and return (action, label)."""
+        if not isinstance(a_share, dict):
+            self._a_share_widget.setVisible(False)
+            return None, ""
+
+        action = str(a_share.get("action_type") or "").strip()
+        action_label = _A_SHARE_ACTION_ZH.get(action, action or "—")
+        self._a_share_action_label.setText(f"动作类型：{action_label}")
+
+        levels = a_share.get("watch_levels") or []
+        lines: list[str] = []
+        if isinstance(levels, list):
+            for item in levels:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name") or "观察位").strip()
+                price = _format_watch_price(item.get("price"))
+                usage = str(item.get("usage") or "").strip()
+                basis = str(item.get("basis") or "").strip()
+                tail = f"（{basis}）" if basis else ""
+                if usage:
+                    lines.append(f"{name}: {price} - {usage}{tail}")
+                else:
+                    lines.append(f"{name}: {price}{tail}")
+        self._a_share_levels_label.setText(
+            "观察位：\n" + "\n".join(lines) if lines else "观察位：—"
+        )
+
+        position_note = str(a_share.get("position_note") or "").strip()
+        self._a_share_position_label.setText(
+            f"持仓说明：{position_note}" if position_note else "持仓说明：—"
+        )
+
+        constraints = a_share.get("constraints") or []
+        if isinstance(constraints, list):
+            constraints_text = "；".join(str(x) for x in constraints if x)
+        else:
+            constraints_text = str(constraints)
+        self._a_share_constraints_label.setText(
+            f"约束：{constraints_text}" if constraints_text else "约束：—"
+        )
+        self._a_share_widget.setVisible(True)
+        return action, action_label
+
     # ── Public API ────────────────────────────────────────────────────────
 
     def set_decision(
@@ -408,8 +504,10 @@ class DecisionPanel(QWidget):
         diagnosis_summary: dict | None = None,
         stage1_diagnosis: dict | None = None,
         decision_stance: str | None = None,
+        a_share: dict | None = None,
     ) -> None:
         self._apply_market_diagnosis(diagnosis_summary, stage1_diagnosis)
+        a_share_action, a_share_label = self._apply_a_share(a_share)
 
         order_type = decision.get("order_type", _NO_ORDER)
         reasoning = decision.get("reasoning", decision.get("brief_reasoning", ""))
@@ -422,8 +520,10 @@ class DecisionPanel(QWidget):
 
         if order_type == _NO_ORDER:
             self._reset_conclusion_bar_side_labels()
-            self._conclusion_label.setText("不下单")
-            self._set_conclusion_bar_style(center_color="#8b949e")
+            self._conclusion_label.setText(a_share_label or "不下单")
+            self._set_conclusion_bar_style(
+                center_color=_A_SHARE_ACTION_COLOR.get(a_share_action or "", "#8b949e")
+            )
             self._details_widget.setVisible(False)
             self._apply_trade_confidence(
                 trade_conf, trade_conf_reasoning,
@@ -516,6 +616,7 @@ class DecisionPanel(QWidget):
             "font-size: 16px; font-weight: bold; color: #6e7681;"
         )
         self._details_widget.setVisible(False)
+        self._a_share_widget.setVisible(False)
 
         self._trade_conf_bar.setValue(0)
         self._trade_conf_title.setVisible(False)

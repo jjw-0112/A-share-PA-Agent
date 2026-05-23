@@ -17,6 +17,7 @@ _TIMEFRAME_SECONDS = {
     "1h": 60 * 60,
     "4h": 4 * 60 * 60,
     "1d": 24 * 60 * 60,
+    "1w": 7 * 24 * 60 * 60,
 }
 
 
@@ -24,6 +25,8 @@ def timeframe_to_seconds(timeframe: str) -> int | None:
     """Map timeframe string (e.g. ``5m``, ``1h``) to bar duration in seconds."""
     tf = str(timeframe or "").strip()
     if not tf:
+        return None
+    if tf == "1M":
         return None
     if tf in _TIMEFRAME_SECONDS:
         return _TIMEFRAME_SECONDS[tf]
@@ -66,6 +69,8 @@ def current_forming_ts(bars_newest_first: list[KlineBar]) -> int | None:
     """Return ts_open of the newest (forming) bar, or None if empty."""
     if not bars_newest_first:
         return None
+    if bars_newest_first[0].closed:
+        return None
     return int(bars_newest_first[0].ts_open)
 
 
@@ -76,4 +81,6 @@ def forming_bar_has_closed(
     """True when a new forming bar replaced the one we were waiting on."""
     if not bars_newest_first:
         return False
+    if bars_newest_first[0].closed:
+        return True
     return int(bars_newest_first[0].ts_open) != waited_ts_open

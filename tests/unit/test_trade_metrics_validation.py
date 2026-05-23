@@ -14,6 +14,22 @@ from pa_agent.util.trade_metrics import (
 validator = JsonValidator()
 
 
+def _a_share_long_plan(price: float = 102.1) -> dict:
+    return {
+        "action_type": "long_plan",
+        "watch_levels": [
+            {
+                "name": "突破触发",
+                "price": price,
+                "basis": "测试观察位",
+                "usage": "条件做多",
+            }
+        ],
+        "position_note": "未提供持仓信息，减仓/防守仅适用于已有持仓者",
+        "constraints": ["不输出开空计划", "不要求用户输入持仓", "不计算仓位数量"],
+    }
+
+
 def _frame() -> KlineFrame:
     return KlineFrame(
         symbol="XAUUSD",
@@ -52,6 +68,7 @@ def _stage2_trade_obj(**decision_overrides) -> dict:
     decision.update(decision_overrides)
     return {
         "decision": decision,
+        "a_share": _a_share_long_plan(float(decision.get("entry_price") or 102.1)),
         "diagnosis_summary": {
             "cycle_position": "normal_channel",
             "direction": "bullish",
@@ -162,6 +179,7 @@ def test_stage2_validator_rejects_bad_rr() -> None:
             "entry_basis_extreme": "high",
             "entry_rule": "K2高点上方1跳动",
         },
+        "a_share": _a_share_long_plan(4527.4),
         "diagnosis_summary": {
             "cycle_position": "normal_channel",
             "direction": "bullish",
@@ -239,19 +257,19 @@ def test_stage2_validator_rejects_stale_entry_bar() -> None:
 def test_stage2_validator_accepts_pending_limit_entry_bar() -> None:
     obj = _stage2_trade_obj(
         order_type="限价单",
-        order_direction="做空",
+        order_direction="做多",
         entry_price=101.0,
-        take_profit_price=96.0,
-        stop_loss_price=103.0,
+        take_profit_price=106.0,
+        stop_loss_price=99.0,
         trade_confidence=65,
         estimated_win_rate=60,
         entry_basis_bar=None,
         entry_basis_extreme=None,
-        entry_rule="等待价格反弹到阻力位后挂限价卖单",
+        entry_rule="等待价格回踩支撑位后挂限价买单",
     )
-    obj["bar_analysis"]["always_in"] = "short"
+    obj["bar_analysis"]["always_in"] = "long"
     obj["bar_analysis"]["signal_bar"]["bar"] = "K2"
-    obj["bar_analysis"]["signal_bar"]["pattern"] = "L1"
+    obj["bar_analysis"]["signal_bar"]["pattern"] = "H1"
     obj["bar_analysis"]["entry_bar"] = {
         "bar": None,
         "strength": "not_triggered",
@@ -271,10 +289,10 @@ def test_stage2_validator_accepts_pending_limit_entry_bar() -> None:
 def test_stage2_validator_accepts_planned_limit_without_signal_bar() -> None:
     obj = _stage2_trade_obj(
         order_type="限价单",
-        order_direction="做空",
+        order_direction="做多",
         entry_price=101.0,
-        take_profit_price=96.0,
-        stop_loss_price=103.0,
+        take_profit_price=106.0,
+        stop_loss_price=99.0,
         trade_confidence=50,
         trade_confidence_reasoning="极度激进档接受无信号棒瑕疵",
         estimated_win_rate=55,
@@ -282,7 +300,7 @@ def test_stage2_validator_accepts_planned_limit_without_signal_bar() -> None:
         entry_basis_extreme=None,
         entry_rule=None,
     )
-    obj["bar_analysis"]["always_in"] = "short"
+    obj["bar_analysis"]["always_in"] = "long"
     obj["bar_analysis"]["signal_bar"] = {
         "bar": None,
         "quality": "invalid",

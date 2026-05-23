@@ -65,6 +65,12 @@ def _valid_stage2() -> dict:
             "risk_assessment": "high risk",
             "invalidation_condition": "price breaks above 2700",
         },
+        "a_share": {
+            "action_type": "no_action",
+            "watch_levels": [],
+            "position_note": "未提供持仓信息，减仓/防守仅适用于已有持仓者",
+            "constraints": ["不输出开空计划", "不要求用户输入持仓", "不计算仓位数量"],
+        },
         "diagnosis_summary": {
             "cycle_position": "normal_channel",
             "direction": "bullish",
@@ -179,6 +185,15 @@ def test_invalid_enum_value_is_category_c():
     result = validator.validate("stage1", json.dumps(obj))
     assert isinstance(result, ValidationError)
     assert result.category == "c"
+
+
+def test_stage1_bar_role_alias_is_normalized():
+    """Common bar_by_bar_summary role aliases are accepted and normalized."""
+    obj = _valid_stage1()
+    obj["bar_by_bar_summary"][0]["role"] = "continuation"
+    result = validator.validate("stage1", json.dumps(obj))
+    assert isinstance(result, Ok), f"Expected Ok, got {result}"
+    assert result.obj["bar_by_bar_summary"][0]["role"] == "confirmation"
 
 
 def test_plain_text_is_category_d():

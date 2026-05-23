@@ -15,13 +15,13 @@ def fake_secret_store(monkeypatch):
     class _FakeStore:
         @staticmethod
         def encrypt(s: str) -> str:
-            return f"ENC:{s}"
+            return f"ENC:{s[::-1]}"
 
         @staticmethod
         def decrypt(s: str) -> str:
             if not s.startswith("ENC:"):
                 raise ValueError("bad ciphertext")
-            return s[4:]
+            return s[4:][::-1]
 
     monkeypatch.setattr(ss_mod, "SecretStore", _FakeStore)
     return _FakeStore
@@ -37,7 +37,9 @@ def test_defaults(tmp_path, fake_secret_store):
     assert s.provider.reasoning_effort == "max"
     assert s.provider.context_window == 2_000_000
     assert s.general.default_bar_count == 100
-    assert s.general.last_symbol == "XAUUSDm"
+    assert s.general.data_source_kind == "akshare_a_share"
+    assert s.general.refresh_interval_ms == 5000
+    assert s.general.last_symbol == "STOCK:600519"
     assert s.general.last_timeframe == "15m"
     assert s.general.decision_stance == "balanced"
     assert s.general.decision_flow_auto_play is True
@@ -66,7 +68,7 @@ def test_no_plaintext_key_on_disk(tmp_path, fake_secret_store):
     raw = p.read_text(encoding="utf-8")
     assert "sk-super-secret-key" not in raw, "plaintext key must not appear on disk"
     assert "api_key_encrypted" in raw, "encrypted key must be present"
-    assert "ENC:sk-super-secret-key" in raw, "fake-encrypted value must be present"
+    assert "ENC:yek-terces-repus-ks" in raw, "fake-encrypted value must be present"
 
 
 def test_corrupt_json_returns_defaults(tmp_path, fake_secret_store):

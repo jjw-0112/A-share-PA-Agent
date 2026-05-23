@@ -15,7 +15,9 @@ from pa_agent.util.threading import CancelToken, OrchestratorEvent
 def _make_text_reply(text: str) -> MagicMock:
     reply = MagicMock()
     reply.content = text
+    reply.reasoning_content = ""
     reply.raw = {"content": text}
+    reply.latency_ms = 1.0
     reply.usage = MagicMock()
     reply.usage.prompt_tokens = 100
     reply.usage.completion_tokens = 50

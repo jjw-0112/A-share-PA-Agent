@@ -338,6 +338,11 @@ class JsonValidator:
                 invalid.extend(no_order_err["fields"])
                 allowed.update(no_order_err["allowed"])
 
+            a_share_err = self._check_a_share_consistency(obj)
+            if a_share_err:
+                invalid.extend(a_share_err["fields"])
+                allowed.update(a_share_err["allowed"])
+
             breakout_err = self._check_breakout_order_basis(obj)
             if breakout_err:
                 invalid.extend(breakout_err["fields"])
@@ -408,9 +413,72 @@ class JsonValidator:
                         "entry_price": ["<finite number>"],
                         "take_profit_price": ["<finite number>"],
                         "stop_loss_price": ["<finite number>"],
-                        "order_direction": ["做多", "做空"],
+                        "order_direction": ["做多"],
                     },
                 }
+        return None
+
+    @staticmethod
+    def _check_a_share_consistency(obj: dict) -> dict | None:
+        """Enforce A-share long-only output semantics."""
+        decision = obj.get("decision", {})
+        a_share = obj.get("a_share", {})
+        if not isinstance(decision, dict) or not isinstance(a_share, dict):
+            return None
+
+        fields: list[str] = []
+        allowed: dict[str, list] = {}
+        order_type = decision.get("order_type")
+        direction = decision.get("order_direction")
+        action_type = a_share.get("action_type")
+        watch_levels = a_share.get("watch_levels")
+        constraints = a_share.get("constraints")
+
+        if direction == "做空":
+            fields.append("decision.order_direction")
+            allowed["decision.order_direction"] = ["做多", None]
+
+        constraint_text = "\n".join(str(x) for x in constraints or [])
+        if "不输出开空计划" not in constraint_text:
+            fields.append("a_share.constraints")
+            allowed["a_share.constraints"] = ["必须包含：不输出开空计划"]
+
+        executable_order = order_type in ("限价单", "突破单", "市价单")
+        if action_type == "long_plan":
+            if not executable_order:
+                fields.append("decision.order_type")
+                allowed["decision.order_type"] = ["限价单", "突破单", "市价单"]
+            if direction != "做多":
+                fields.append("decision.order_direction")
+                allowed["decision.order_direction"] = ["做多"]
+            if not isinstance(watch_levels, list) or not watch_levels:
+                fields.append("a_share.watch_levels")
+                allowed["a_share.watch_levels"] = ["long_plan 必须提供至少一个观察位"]
+        else:
+            if executable_order:
+                fields.append("decision.order_type")
+                allowed["decision.order_type"] = ["不下单", "只有 a_share.action_type=long_plan 才可下单"]
+
+        if action_type == "risk_warning":
+            price_fields = [
+                "entry_price",
+                "entry_basis_bar",
+                "entry_basis_extreme",
+                "entry_rule",
+                "take_profit_price",
+                "stop_loss_price",
+                "order_direction",
+            ]
+            violated = [f"decision.{f}" for f in price_fields if decision.get(f) is not None]
+            if order_type != "不下单":
+                violated.append("decision.order_type")
+            if violated:
+                fields.extend(violated)
+                for f in violated:
+                    allowed[f] = [None] if f != "decision.order_type" else ["不下单"]
+
+        if fields:
+            return {"fields": fields, "allowed": allowed}
         return None
 
     @staticmethod

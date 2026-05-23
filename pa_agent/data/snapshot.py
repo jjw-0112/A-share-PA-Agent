@@ -16,8 +16,8 @@ def take_snapshot(buffer: KlineBuffer, n: int, symbol: str, timeframe: str) -> K
     """Build an immutable KlineFrame from the *n* most recent bars in *buffer*.
 
     Sequence numbering:
-    - bars[0].seq == 1, closed == False  (the forming bar)
-    - bars[i].seq == i+1, closed == True  for i >= 1
+    - bars[0].seq == 1, closed mirrors the source bar
+    - bars[i].seq == i+1
     - {bar.seq for bar in bars} == {1, ..., n}  (bijection)
 
     Raises ValueError if the buffer has fewer than *n* bars.
@@ -41,7 +41,7 @@ def take_snapshot(buffer: KlineBuffer, n: int, symbol: str, timeframe: str) -> K
                 low=bar.low,
                 close=bar.close,
                 volume=bar.volume,
-                closed=(i != 0),   # index 0 is always the forming bar
+                closed=bool(bar.closed),
             )
         )
 
@@ -103,10 +103,15 @@ def build_live_frame(
     This is for UI only. The analysis snapshot must still use
     ``build_analysis_frame`` so AI always sees closed-only candles.
     """
-    if len(bars_raw) < n_closed + 1:
+    if not bars_raw:
         return None
 
-    raw = bars_raw[: n_closed + 1]  # forming + N closed
+    has_forming = bars_raw[0].closed is False
+    needed = n_closed + 1 if has_forming else n_closed
+    if len(bars_raw) < needed:
+        return None
+
+    raw = bars_raw[:needed]
     rebased: list[KlineBar] = [
         KlineBar(
             seq=i + 1,
@@ -116,7 +121,7 @@ def build_live_frame(
             low=b.low,
             close=b.close,
             volume=b.volume,
-            closed=(i != 0),
+            closed=bool(b.closed),
         )
         for i, b in enumerate(raw)
     ]
@@ -138,16 +143,20 @@ def build_analysis_frame(
 ) -> KlineFrame | None:
     """Build a snapshot for AI analysis: *n* newest **closed** bars only.
 
-    *bars_raw* is newest-first; ``bars_raw[0]`` is the forming (unclosed) bar
-    and is discarded. Returns None if fewer than ``n + 1`` bars are available.
+    *bars_raw* is newest-first. ``bars_raw[0]`` is discarded only when the data
+    source marks it as forming (``closed=False``). This lets after-hours public
+    sources keep the latest fully closed A-share bar instead of losing it.
 
     Chart and AI must both use this (or ``build_display_frame``) so K-line
     seq numbers refer to the same candles.
     """
-    if len(bars_raw) < n + 1:
+    if not bars_raw:
         return None
 
-    closed_raw = bars_raw[1 : n + 1]
+    start = 1 if bars_raw[0].closed is False else 0
+    closed_raw = [b for b in bars_raw[start:] if b.closed][:n]
+    if len(closed_raw) < n:
+        return None
     rebased: list[KlineBar] = [
         KlineBar(
             seq=i + 1,

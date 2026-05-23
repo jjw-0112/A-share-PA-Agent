@@ -19,7 +19,9 @@ from .conftest import VALID_STAGE1, make_reply
 def _make_reply(content_dict: dict) -> MagicMock:
     reply = MagicMock()
     reply.content = json.dumps(content_dict)
+    reply.reasoning_content = ""
     reply.raw = {"content": reply.content}
+    reply.latency_ms = 1.0
     reply.usage = MagicMock()
     reply.usage.prompt_tokens = 100
     reply.usage.completion_tokens = 50
@@ -47,6 +49,12 @@ NO_ORDER_WITH_PRICE = {
         "watch_points": ["watch1"],
         "risk_assessment": "high risk",
         "invalidation_condition": "n/a",
+    },
+    "a_share": {
+        "action_type": "no_action",
+        "watch_levels": [],
+        "position_note": "未提供持仓信息，减仓/防守仅适用于已有持仓者",
+        "constraints": ["不输出开空计划", "不要求用户输入持仓", "不计算仓位数量"],
     },
     "diagnosis_summary": {
         "cycle_position": "normal_channel",

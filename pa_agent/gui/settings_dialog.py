@@ -115,6 +115,20 @@ class SettingsDialog(QDialog):
         self._context_warning_spin.setSuffix(" %")
         general_form.addRow("上下文警告阈值:", self._context_warning_spin)
 
+        self._stream_font_spin = QSpinBox()
+        self._stream_font_spin.setRange(8, 28)
+        self._stream_font_spin.setSuffix(" pt")
+        self._stream_font_spin.setToolTip(
+            "「实时」标签页中思考过程/撰写回答大文本框，以及下方追问输入框的字体大小"
+        )
+        general_form.addRow("实时窗口字号:", self._stream_font_spin)
+
+        self._chart_seq_font_spin = QSpinBox()
+        self._chart_seq_font_spin.setRange(6, 24)
+        self._chart_seq_font_spin.setSuffix(" pt")
+        self._chart_seq_font_spin.setToolTip("K 线图上 #1、#3… 序号标签的字体大小")
+        general_form.addRow("图表K线序号字号:", self._chart_seq_font_spin)
+
         self._incremental_max_new_bars_spin = QSpinBox()
         self._incremental_max_new_bars_spin.setRange(0, 500)
         self._incremental_max_new_bars_spin.setSuffix(" 根")
@@ -134,13 +148,13 @@ class SettingsDialog(QDialog):
         )
         self._decision_stance_combo.setToolTip(
             "仅影响阶段二交易决策倾向；保守与改版前一致。"
-            "均衡、激进逐级提高下单意愿；极度激进在未触犯 §14 硬性禁止时"
-            "必须给出具体做多/做空及限价/突破/市价方案。"
+            "均衡、激进逐级提高下单意愿；A股模式只允许条件做多计划，"
+            "看空场景会表达为风险提示或等待。"
         )
         general_form.addRow("交易倾向:", self._decision_stance_combo)
 
         self._last_symbol_edit = QLineEdit()
-        general_form.addRow("上次品种:", self._last_symbol_edit)
+        general_form.addRow("上次A股标的:", self._last_symbol_edit)
 
         self._last_timeframe_edit = QLineEdit()
         general_form.addRow("上次周期:", self._last_timeframe_edit)
@@ -198,6 +212,8 @@ class SettingsDialog(QDialog):
         self._default_bar_count_spin.setValue(g.default_bar_count)
         self._refresh_interval_spin.setValue(g.refresh_interval_ms)
         self._context_warning_spin.setValue(int(g.context_warning_threshold_pct))
+        self._stream_font_spin.setValue(int(getattr(g, "stream_pane_font_pt", 11)))
+        self._chart_seq_font_spin.setValue(int(getattr(g, "chart_seq_label_font_pt", 7)))
         self._incremental_max_new_bars_spin.setValue(
             int(getattr(g, "incremental_max_new_bars", 10))
         )
@@ -259,6 +275,8 @@ class SettingsDialog(QDialog):
         g.default_bar_count = self._default_bar_count_spin.value()
         g.refresh_interval_ms = self._refresh_interval_spin.value()
         g.context_warning_threshold_pct = float(self._context_warning_spin.value())
+        g.stream_pane_font_pt = self._stream_font_spin.value()
+        g.chart_seq_label_font_pt = self._chart_seq_font_spin.value()
         g.incremental_max_new_bars = self._incremental_max_new_bars_spin.value()
         g.decision_stance = self._decision_stance_combo.currentData()  # type: ignore[assignment]
         g.last_symbol = self._last_symbol_edit.text().strip()

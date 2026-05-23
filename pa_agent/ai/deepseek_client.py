@@ -1,7 +1,9 @@
 """DeepSeek AI client (OpenAI-compatible API)."""
 from __future__ import annotations
 
+import importlib.util
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, TYPE_CHECKING
@@ -21,6 +23,20 @@ else:
     _OPENAI_IMPORT_ERROR = None
 
 logger = logging.getLogger(__name__)
+
+_PROXY_ENV_VARS = (
+    "ALL_PROXY",
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "all_proxy",
+    "https_proxy",
+    "http_proxy",
+)
+_SOCKS_PROXY_PREFIXES = ("socks://", "socks4://", "socks5://", "socks5h://")
+_SOCKS_PROXY_MISSING_MESSAGE = (
+    "检测到当前网络使用 SOCKS 代理，但缺少 socksio 依赖。"
+    "请重新安装项目依赖，或运行：python -m pip install \"httpx[socks]\""
+)
 
 
 @dataclass
@@ -59,6 +75,23 @@ def _is_kkai_openai_proxy(base_url: str) -> bool:
 
 def _is_packyapi(base_url: str) -> bool:
     return "packyapi.com" in (base_url or "").lower()
+
+
+def _configured_socks_proxy_env() -> str | None:
+    """Return the proxy env var name when it points to a SOCKS proxy."""
+    for env_name in _PROXY_ENV_VARS:
+        value = (os.environ.get(env_name) or "").strip().lower()
+        if value.startswith(_SOCKS_PROXY_PREFIXES):
+            return env_name
+    return None
+
+
+def _ensure_socks_proxy_dependency() -> None:
+    """Fail with a readable message before httpx raises its raw socksio error."""
+    if _configured_socks_proxy_env() is None:
+        return
+    if importlib.util.find_spec("socksio") is None:
+        raise RuntimeError(_SOCKS_PROXY_MISSING_MESSAGE)
 
 
 # Packy claude-officially returns 400 if max_tokens exceeds model output cap.
@@ -274,6 +307,7 @@ class DeepSeekClient:
         if _OpenAI is None:
             raise RuntimeError("openai package is not installed") from _OPENAI_IMPORT_ERROR
 
+        _ensure_socks_proxy_dependency()
         client = _OpenAI(
             base_url=self._settings.base_url,
             api_key=self._settings.api_key,
@@ -405,6 +439,7 @@ class DeepSeekClient:
         if _OpenAI is None:
             raise RuntimeError("openai package is not installed") from _OPENAI_IMPORT_ERROR
 
+        _ensure_socks_proxy_dependency()
         client = _OpenAI(
             base_url=self._settings.base_url,
             api_key=self._settings.api_key,

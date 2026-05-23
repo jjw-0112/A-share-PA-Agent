@@ -107,6 +107,17 @@ VALID_STAGE1 = {
     "htf_context": "bullish trend",
     "entry_setup": "buy on pullback",
     "strategy_files_needed": ["上涨通道分析识别.txt"],
+    "bar_by_bar_summary": [
+        {
+            "bar": "K1",
+            "role": "confirmation",
+            "bar_type": "trend_bull",
+            "context_effect": "strengthens_bull",
+            "follow_through": "pending",
+            "trapped_side": "none",
+            "reason": "最新K线延续多头结构",
+        }
+    ],
     "gate_trace": SAMPLE_GATE_TRACE,
     "gate_result": "proceed",
 }
@@ -130,10 +141,45 @@ VALID_STAGE2 = {
         "risk_assessment": "low risk",
         "invalidation_condition": "break below 1980",
     },
+    "a_share": {
+        "action_type": "long_plan",
+        "watch_levels": [
+            {
+                "name": "突破触发",
+                "price": 2000.0,
+                "basis": "K2 高点突破后回踩确认",
+                "usage": "满足条件后才考虑做多计划",
+            }
+        ],
+        "position_note": "未提供持仓信息，减仓/防守仅适用于已有持仓者",
+        "constraints": ["不输出开空计划", "不要求用户输入持仓", "不计算仓位数量"],
+    },
     "diagnosis_summary": {
         "cycle_position": "normal_channel",
         "direction": "bullish",
         "key_signals": ["signal1"],
+    },
+    "bar_analysis": {
+        "always_in": "long",
+        "last_closed_bar": "K1",
+        "bar_type": "trend_bull",
+        "signal_bar": {
+            "bar": "K2",
+            "quality": "strong",
+            "pattern": "H1",
+            "reason": "信号棒质量较好",
+        },
+        "entry_bar": {
+            "bar": "K1",
+            "strength": "strong",
+            "follow_through": True,
+            "still_valid": True,
+            "freshness": "fresh",
+        },
+        "second_entry": {
+            "is_second_entry": False,
+            "type": "none",
+        },
     },
     "decision_trace": SAMPLE_DECISION_TRACE,
     "terminal": {

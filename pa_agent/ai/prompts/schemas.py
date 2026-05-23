@@ -241,6 +241,46 @@ STAGE1_SCHEMA: dict = {
 
 # ── Stage 2 schema ────────────────────────────────────────────────────────────
 
+_A_SHARE_WATCH_LEVEL: dict = {
+    "type": "object",
+    "required": ["name", "price", "basis", "usage"],
+    "properties": {
+        "name": {"type": "string"},
+        "price": {"type": ["number", "null"]},
+        "basis": {"type": "string"},
+        "usage": {"type": "string"},
+    },
+    "additionalProperties": True,
+}
+
+_A_SHARE: dict = {
+    "type": "object",
+    "required": ["action_type", "watch_levels", "position_note", "constraints"],
+    "properties": {
+        "action_type": {
+            "type": "string",
+            "enum": [
+                "analysis_only",
+                "long_watch",
+                "long_plan",
+                "risk_warning",
+                "no_action",
+            ],
+        },
+        "watch_levels": {
+            "type": "array",
+            "items": _A_SHARE_WATCH_LEVEL,
+        },
+        "position_note": {"type": "string"},
+        "constraints": {
+            "type": "array",
+            "minItems": 1,
+            "items": {"type": "string"},
+        },
+    },
+    "additionalProperties": True,
+}
+
 _DECISION_BASE: dict = {
     "type": "object",
     "required": [
@@ -300,7 +340,8 @@ _DECISION_BASE: dict = {
                 },
             },
         },
-        # 有下单 → price fields must be numbers, direction must be 做多/做空
+        # 有下单 → price fields must be numbers, direction must be 做多/做空.
+        # A-share-only restrictions are enforced by JsonValidator cross-checks.
         {
             "if": {
                 "properties": {
@@ -347,9 +388,10 @@ _DECISION_BASE: dict = {
 STAGE2_SCHEMA: dict = {
     "$schema": "http://json-schema.org/draft-07/schema#",
     "type": "object",
-    "required": ["decision", "diagnosis_summary", "decision_trace", "terminal"],
+    "required": ["decision", "a_share", "diagnosis_summary", "decision_trace", "terminal"],
     "properties": {
         "decision": _DECISION_BASE,
+        "a_share": _A_SHARE,
         "diagnosis_summary": {
             "type": "object",
             "required": ["cycle_position", "direction", "key_signals"],

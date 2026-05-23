@@ -18,7 +18,9 @@ from .conftest import VALID_STAGE1
 def _make_reply(content_dict: dict) -> MagicMock:
     reply = MagicMock()
     reply.content = json.dumps(content_dict)
+    reply.reasoning_content = ""
     reply.raw = {"content": reply.content}
+    reply.latency_ms = 1.0
     reply.usage = MagicMock()
     reply.usage.prompt_tokens = 100
     reply.usage.completion_tokens = 50

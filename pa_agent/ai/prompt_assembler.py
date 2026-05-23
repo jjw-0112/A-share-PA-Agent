@@ -23,6 +23,31 @@ _LANGUAGE_ZH_RULE = """
 - **思考过程**：扩展思考、内部推理、以及写入 JSON 的 `reason`、`diagnosis_confidence_reasoning`、`trade_confidence_reasoning`、`estimated_win_rate_reasoning` 等说明，**全程使用简体中文**。禁止用英文写推理段落或中英混杂的长句（常见缩写如 HH、HL、Spike、TR 可保留）。
 - **最终输出**：阶段一诊断 JSON、阶段二决策 JSON 中所有面向用户的字符串（含 `reasoning`、`key_factors`、`risk_assessment`、`watch_points`、`gate_trace`/`decision_trace` 的 `question` 与 `reason` 等）**一律使用简体中文**。
 - **仅允许英文或固定英文枚举**：JSON 字段名（schema 键名）、规定的枚举取值（如 `proceed`、`wait`、`bullish`、`bearish`）、策略文件名、K 线序号格式（如 `K1`、`K42-K1`）。
+- **价格行为术语**：思考与 JSON 说明中优先使用下列简体中文 PA 术语（见下节），避免自造词或仅用英文描述。
+""".strip()
+
+_PA_TERMINOLOGY_ZH = """
+## 价格行为常用术语（简体中文，思考与 JSON 说明中优先使用）
+
+| 术语 | 含义 / 用法提示 |
+|------|----------------|
+| 信号棒 | 触发入场计划的 K 线；极点外 1 跳动设止损/突破单 |
+| 入场棒 | 实际触发入场的 K 线；须在信号棒之后 |
+| 确认棒 / 跟随 | 信号或入场后 1–2 根同向延续；无跟随则信号易失败 |
+| 突破 | 价格越过结构位、通道线、区间边界或信号棒极点 |
+| 假突破 | 突破后快速回到原结构内；区间中常见 |
+| 突破回踩 / 回测 | 突破后回撤测试被突破位再延续（勿与「历史回测」混淆） |
+| 外包棒 | 高低点完全包含前一根；方向未定时勿追两端 |
+| 内包棒 | 完全在前一根范围内；ii/iii 为连续内包 |
+| 流星线 | 长上影、小实体，常作顶部拒绝 |
+| 锤子线 | 长下影、小实体，常作底部拒绝 |
+| 十字星 | 开收接近、多空犹豫 |
+| 趋势棒 | 实体大、收盘近极点、影线短 |
+| 铁丝网 | 极窄重叠区间，默认少交易 |
+| 被套 | 突破方向上的交易者被迫止损离场 |
+| 磁力位 | 失败信号棒/入场棒极点吸引价格回测 |
+
+英文缩写（可保留）：SB/EB、OB/IB、H1/H2、L1/L2、MTR、AIL/AIS、20GB。
 """.strip()
 
 _THINKING_CONTENT_OUTPUT_RULE = """
@@ -31,7 +56,7 @@ _THINKING_CONTENT_OUTPUT_RULE = """
 启用扩展思考时，**思考区仅用于推演草稿**；**程序只读取 assistant 消息的 `content`（正文）** 做 JSON 校验，**不会**把 `reasoning_content` / 思考流当作阶段结果。
 
 **你必须做到：**
-1. 思考可以较长，但思考结束后**必须在 `content` 正文里输出完整、可 `json.loads` 的裸 JSON 对象**（阶段一诊断 JSON 或阶段二决策 JSON）。
+1. 思考可以较长，但思考结束后**必须在 `content` 正文里输出完整、可 `json.loads` 的裸 JSON 对象**（阶段一诊断 JSON 或阶段二决策 JSON）。界面会把思考流与 `content` 正文（撰写回答）都显示在「思考过程」窗口；**正文 JSON 仍必须写在 `content`，不能只在思考里写完。**
 2. **禁止**把完整 JSON **只**写在思考里而让 `content` 为空、空白或纯叙述文字。
 3. **禁止**在 `content` 里输出 markdown 说明、英文长文分析、或「详见上文思考」——`content` 里**只能**是裸 JSON。
 4. 若思考预算较大，请**预留足够 token** 给最终 JSON；宁可压缩思考篇幅，也**不得**省略正文 JSON。
@@ -49,7 +74,7 @@ _STAGE1_TAIL_REMINDER = (
 
 _STAGE2_TAIL_REMINDER = (
     "【最后一步·必做】思考结束后，立即在 assistant 正文 `content` 输出完整阶段二裸 JSON"
-    "（含 decision、decision_trace、terminal）。思考用简体中文并尽量简洁；`content` 不得为空。"
+    "（含 decision、a_share、decision_trace、terminal）。思考用简体中文并尽量简洁；`content` 不得为空。"
     "若 token 紧张，优先保证 `content` 有 JSON，可缩短思考。"
 ).strip()
 
@@ -130,6 +155,7 @@ JSON 字符串内不要用英文双引号强调，改用「」或不用引号。
 **逐K摘要硬规则：**
 - 必须输出 `bar_by_bar_summary`，覆盖最近 8–12 根已收盘 K 线（数据不足则覆盖全部；勿超过 12 条以免截断 gate_trace）。
 - 每条只写该 K 线对当前结构的增量作用，不写下单价格、不写止损止盈。
+- `role` 只能使用示例中的 8 个英文枚举；延续/跟随棒统一写 `confirmation`，不要写 `continuation`。
 - K线序号方向：K1 是最新已收盘，K2 是它前一根；判断 K2 的后续跟随时看 K1，判断 K3 的后续跟随时看 K2/K1；K1 的跟随通常为 pending。
 - `bar_type` 必须优先对齐程序提供的 K线几何特征表。
 
@@ -170,11 +196,12 @@ _STAGE2_OUTPUT_CONTRACT = """
 禁止用 markdown 代码围栏（不要写 ```json 或结尾的 ```），只输出裸 JSON 对象。
 JSON 字符串内不要用英文双引号强调，改用「」或不用引号。
 重要规则：当 order_type 为“不下单”时，entry_price、take_profit_price、stop_loss_price、order_direction 必须全部为 null。
+A股硬约束：必须输出顶层 `a_share` 对象；禁止输出开空计划；看空只能写成风险提示、防守提醒或等待。只有 `a_share.action_type="long_plan"` 时才允许 `decision.order_direction="做多"` 并填写入场/止损/止盈；其他 action_type 一律 `order_type="不下单"`。
 
 ```json
 {
   "decision": {
-    "order_direction": "做多|做空|null",
+    "order_direction": "做多|null",
     "order_type": "限价单|突破单|市价单|不下单",
     "entry_price": null,
     "entry_basis_bar": null,
@@ -193,6 +220,19 @@ JSON 字符串内不要用英文双引号强调，改用「」或不用引号。
     "watch_points": [],
     "risk_assessment": "",
     "invalidation_condition": ""
+  },
+  "a_share": {
+    "action_type": "analysis_only|long_watch|long_plan|risk_warning|no_action",
+    "watch_levels": [
+      {
+        "name": "支撑|压力|突破触发|失效位",
+        "price": 0,
+        "basis": "来自K线结构/均线/前高前低/区间边界",
+        "usage": "观察、触发、确认、失效或已有持仓防守用途"
+      }
+    ],
+    "position_note": "未提供持仓信息，减仓/防守仅适用于已有持仓者",
+    "constraints": ["不输出开空计划", "不要求用户输入持仓", "不计算仓位数量"]
   },
   "diagnosis_summary": {
     "cycle_position": "",
@@ -256,7 +296,7 @@ JSON 字符串内不要用英文双引号强调，改用「」或不用引号。
 
 **交易者方程（10.3）规则：**
 - 必须使用 **decision 中已填写的 entry_price / stop_loss_price / take_profit_price** 做数值计算，**禁止**用 K 线收盘、信号棒极点间距或「计划中的 1.8 点/3 点」代替三价
-- 做多：风险点数 = entry − stop，回报点数 = take_profit − entry；做空：风险 = stop − entry，回报 = entry − take_profit
+- A股只允许做多计划：风险点数 = entry − stop，回报点数 = take_profit − entry；不得输出做空公式、做空下单或开空价格
 - 盈亏比 = 回报 ÷ 风险（程序与界面只认此公式；reasoning 中写的 RR 必须与三价一致，否则校验失败）
 - 有下单时：盈亏比不得低于当前交易倾向的底线（保守≥1.5，均衡≥1.2，激进/极度激进≥1.0），且须满足 **胜率%×回报 > (100−胜率)%×风险**
 - 不满足上述任一条 → **10.3 必须判「否」**，order_type=**不下单**，不得输出限价/突破/市价单
@@ -267,7 +307,7 @@ JSON 字符串内不要用英文双引号强调，改用「」或不用引号。
 **突破单 entry_price 硬规则：**
 - order_type="突破单" 时，必须填写 decision.entry_basis_bar、decision.entry_basis_extreme、decision.entry_rule。
 - 做多突破单：entry_basis_extreme 必须为 "high"，entry_price 必须位于 entry_basis_bar 高点上方 1 跳动或至少明确高于该高点。
-- 做空突破单：entry_basis_extreme 必须为 "low"，entry_price 必须位于 entry_basis_bar 低点下方 1 跳动或至少明确低于该低点。
+- 禁止做空突破单；看空时写入 a_share.action_type="risk_warning" 或 "no_action"，decision.order_type="不下单"。
 - 突破单禁止使用 K 线实体中部、当前价附近、EMA 附近或任意折中价作为 entry_price。
 - 如果无法从 K线表确定依据 K 线极点或 tick size，不得编造中间价；应输出 order_type="不下单"，并说明等待信号棒极点被突破。
 - 限价单/市价单不使用 entry_basis_* 字段，可填 null。
@@ -282,10 +322,16 @@ JSON 字符串内不要用英文双引号强调，改用「」或不用引号。
 **跳过规则：**
 - 无持仓：跳过 §12、§13（不写 trace）
 - 不适用分支：skipped:true，answer=不适用
+- A股减仓/防守只能作为“已有持仓者”的风险提示；不要要求用户输入持仓、成本价或资金量，不计算仓位数量。
 
 terminal 必须与 order_type 一致：
 - 有下单 → outcome=trade，terminal.node_id 建议为最后一个 §11 节点
 - 不下单 → outcome=wait 或 reject
+
+`a_share` 必须与 decision 一致：
+- `long_plan`：必须给出至少一个 watch_levels，且 decision 只能是做多订单。
+- `long_watch` / `analysis_only` / `risk_warning` / `no_action`：decision 必须是不下单，所有价格订单字段为 null。
+- `risk_warning`：可列出压力、失效位、防守位，但不得搭配具体买入价或任何做空方案。
 
 阶段一 gate_result 为 wait/unknown 时：系统会短路，不应调用本阶段。
 
@@ -429,7 +475,7 @@ class PromptAssembler:
             atr = frame.indicators.atr14[i]
             ema_str = f"{ema:.4f}" if not math.isnan(ema) else "N/A"
             atr_str = f"{atr:.4f}" if not math.isnan(atr) else "N/A"
-            # ts_open is in milliseconds (MT5 source); convert to seconds for fromtimestamp()
+            # ts_open is in milliseconds; convert to seconds for fromtimestamp()
             dt = datetime.datetime.fromtimestamp(bar.ts_open / 1000).strftime("%Y-%m-%d %H:%M")
             lines.append(
                 f"{bar.seq:<4} | {dt:<19} | {bar.open:<9.4f} | {bar.high:<9.4f} | "
@@ -497,7 +543,7 @@ class PromptAssembler:
 
     def _build_common_system_prompt(self) -> str:
         """Build the stable system prompt shared by Stage 1 and Stage 2."""
-        system_parts = [_LANGUAGE_ZH_RULE, _THINKING_CONTENT_OUTPUT_RULE]
+        system_parts = [_LANGUAGE_ZH_RULE, _PA_TERMINOLOGY_ZH, _THINKING_CONTENT_OUTPUT_RULE]
         system_parts.extend(self._load(name) for name in COMMON_SYSTEM_PROMPT_TXT_FILES)
         return "\n\n---\n\n".join(p for p in system_parts if p)
 
@@ -698,6 +744,7 @@ class PromptAssembler:
             f"请根据以上诊断、闸门路径和K线数据,按《二元决策.txt》§3–§15 输出 JSON 决策结果"
             f"(含 decision_trace 与 terminal)。\n"
             f"注意:如果判断不下单,entry_price、take_profit_price、stop_loss_price、order_direction 必须全部为 null。\n\n"
+            f"A股模式下必须同时输出 a_share；只给多头条件计划，看空表达为风险/防守/等待，禁止开空。\n\n"
             f"{_STAGE2_TAIL_REMINDER}"
         )
 

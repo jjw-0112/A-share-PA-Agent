@@ -60,6 +60,21 @@ def _base_stage2(decision: dict) -> dict:
         )
     obj = {
         "decision": decision,
+        "a_share": {
+            "action_type": "no_action" if is_no_order else "long_plan",
+            "watch_levels": []
+            if is_no_order
+            else [
+                {
+                    "name": "突破触发",
+                    "price": 100.0,
+                    "basis": "测试观察位",
+                    "usage": "条件做多",
+                }
+            ],
+            "position_note": "未提供持仓信息，减仓/防守仅适用于已有持仓者",
+            "constraints": ["不输出开空计划", "不要求用户输入持仓", "不计算仓位数量"],
+        },
         "diagnosis_summary": {
             "cycle_position": "normal_channel",
             "direction": "bullish",

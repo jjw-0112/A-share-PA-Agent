@@ -31,10 +31,11 @@ class CandleItem(pg.GraphicsObject):
         Integer x-axis position (0 = leftmost / oldest visible candle).
     """
 
-    def __init__(self, bar: "KlineBar", x_pos: int) -> None:
+    def __init__(self, bar: "KlineBar", x_pos: float, *, body_width: float = _BODY_WIDTH) -> None:
         super().__init__()
         self._bar = bar
-        self._x = x_pos
+        self._x = float(x_pos)
+        self._body_width = max(0.25, min(0.85, float(body_width)))
         # close >= open → bullish (green UP); close < open → bearish (red DOWN)
         self._color = _COLOR_UP if bar.close >= bar.open else _COLOR_DOWN
         self._generate_picture()
@@ -42,7 +43,7 @@ class CandleItem(pg.GraphicsObject):
     # ── pyqtgraph interface ───────────────────────────────────────────────────
 
     def boundingRect(self) -> QRectF:
-        half = _BODY_WIDTH / 2.0
+        half = self._body_width / 2.0
         top = self._bar.high
         bottom = self._bar.low
         # Add a small margin so the wick tip is not clipped
@@ -51,7 +52,7 @@ class CandleItem(pg.GraphicsObject):
         return QRectF(
             self._x - half,
             bottom - margin,
-            _BODY_WIDTH,
+            self._body_width,
             span + 2 * margin,
         )
 
@@ -74,14 +75,15 @@ class CandleItem(pg.GraphicsObject):
 
         bar = self._bar
         x = float(self._x)
-        half = _BODY_WIDTH / 2.0
+        width = self._body_width
+        half = width / 2.0
 
         body_top = max(bar.open, bar.close)
         body_bottom = min(bar.open, bar.close)
 
         # Body rectangle (ensure non-zero height for doji candles)
         body_height = max(body_top - body_bottom, 1e-8)
-        p.drawRect(QRectF(x - half, body_bottom, _BODY_WIDTH, body_height))
+        p.drawRect(QRectF(x - half, body_bottom, width, body_height))
 
         # Upper wick
         if bar.high > body_top:

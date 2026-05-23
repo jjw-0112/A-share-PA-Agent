@@ -38,6 +38,18 @@ def test_build_analysis_frame_insufficient_data() -> None:
     assert build_analysis_frame(raw, 2, "XAU", "5m") is None
 
 
+def test_build_analysis_frame_keeps_latest_closed_bar_after_hours() -> None:
+    raw = [
+        _bar(1, 300.0, closed=True),
+        _bar(2, 200.0, closed=True),
+        _bar(3, 100.0, closed=True),
+    ]
+    frame = build_analysis_frame(raw, 2, "STOCK:600519", "5m")
+    assert frame is not None
+    assert [b.ts_open for b in frame.bars] == [300.0, 200.0]
+    assert all(b.closed for b in frame.bars)
+
+
 def test_display_frame_matches_analysis_frame() -> None:
     raw = [
         _bar(1, 300.0, closed=False),

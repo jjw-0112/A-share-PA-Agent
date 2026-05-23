@@ -21,14 +21,15 @@ class SeqLabelItem(pg.TextItem):
         Y-axis position (typically the bar's high price).
     """
 
-    _FONT = QFont("Arial", 7)
     _COLOR = QColor(180, 180, 180)  # light grey — unobtrusive
 
-    def __init__(self, seq: int, x_pos: int, y_pos: float) -> None:
+    def __init__(self, seq: int, x_pos: int, y_pos: float, *, font_pt: int = 7) -> None:
+        self.seq = int(seq)
+        self.x_pos = int(x_pos)
         super().__init__(
             text=f"#{seq}",
             color=self._COLOR,
             anchor=(0.5, 1.0),  # horizontally centred, bottom of text at y_pos
         )
-        self.setFont(self._FONT)
+        self.setFont(QFont("Arial", font_pt))
         self.setPos(QPointF(float(x_pos), y_pos))

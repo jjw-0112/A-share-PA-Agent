@@ -84,6 +84,7 @@ class AIStreamPanel(QWidget):
         # Per-stage streamed char counts; text in the pane is never cleared between stages.
         self._stage_chars: dict[str, dict[str, int]] = {}
         self._stage_headers_written: set[str] = set()
+        self._content_headers_written: set[str] = set()
 
         self._setup_ui()
 
@@ -100,17 +101,13 @@ class AIStreamPanel(QWidget):
         self._mode_label.setObjectName("mutedLabel")
         layout.addWidget(self._mode_label)
 
-        rl = QLabel("🧠 思考过程")
+        rl = QLabel("🧠 思考过程 / 撰写回答")
         rl.setStyleSheet("color: #a371f7; font-weight: bold;")
         layout.addWidget(rl)
 
-        mono = QFont("Cascadia Mono", 11)
-        if not mono.exactMatch():
-            mono = QFont("Consolas", 11)
         self._reasoning_edit = QPlainTextEdit()
         self._reasoning_edit.setObjectName("reasoningPane")
         self._reasoning_edit.setReadOnly(True)
-        self._reasoning_edit.setFont(mono)
         self._reasoning_edit.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
         layout.addWidget(self._reasoning_edit, stretch=1)
 
@@ -121,7 +118,23 @@ class AIStreamPanel(QWidget):
         layout.addLayout(self._build_token_bar())
         layout.addWidget(self._build_input_area())
 
+        self._apply_stream_font()
         self.set_input_enabled(False)
+
+    @staticmethod
+    def _mono_font(point_size: int) -> QFont:
+        font = QFont("Cascadia Mono", point_size)
+        if not font.exactMatch():
+            font = QFont("Consolas", point_size)
+        return font
+
+    def _apply_stream_font(self) -> None:
+        point_size = 11
+        if self._settings is not None:
+            point_size = int(getattr(self._settings.general, "stream_pane_font_pt", 11) or 11)
+        font = self._mono_font(point_size)
+        self._reasoning_edit.setFont(font)
+        self._input_edit.setFont(font)
 
     def _build_token_bar(self) -> QHBoxLayout:
         row = QHBoxLayout()
@@ -145,15 +158,27 @@ class AIStreamPanel(QWidget):
         self._input_edit.setPlaceholderText("分析完成后可继续追问…")
         self._input_edit.setMaximumHeight(80)
         row.addWidget(self._input_edit, stretch=1)
+
+        button_col = QVBoxLayout()
+        button_col.setSpacing(6)
         self._send_btn = QPushButton("发送")
         self._send_btn.setObjectName("primaryButton")
         self._send_btn.setMinimumWidth(72)
         self._send_btn.clicked.connect(self._on_send_or_stop)
-        row.addWidget(self._send_btn)
+        button_col.addWidget(self._send_btn)
+
+        self._clear_output_btn = QPushButton("清空")
+        self._clear_output_btn.setMinimumWidth(72)
+        self._clear_output_btn.setToolTip("清空上方“思考过程”窗口内容，不影响当前会话")
+        self._clear_output_btn.clicked.connect(self.clear_stream_output)
+        button_col.addWidget(self._clear_output_btn)
+        button_col.addStretch()
+        row.addLayout(button_col)
         return box
 
     def bind_settings(self, settings: Optional["Settings"]) -> None:
         self._settings = settings
+        self._apply_stream_font()
         self._refresh_mode_label()
 
     def _refresh_mode_label(self) -> None:
@@ -198,9 +223,14 @@ class AIStreamPanel(QWidget):
             counts = self._stage_chars.get(sid)
             if not counts:
                 continue
-            total = counts.get("reasoning", 0) + counts.get("content", 0)
-            if total:
-                parts.append(f"{label} {total:,}字")
+            reasoning_n = counts.get("reasoning", 0)
+            content_n = counts.get("content", 0)
+            if reasoning_n and content_n:
+                parts.append(f"{label} 思考{reasoning_n:,}+回答{content_n:,}字")
+            elif reasoning_n:
+                parts.append(f"{label} 思考{reasoning_n:,}字")
+            elif content_n:
+                parts.append(f"{label} 回答{content_n:,}字")
         if parts:
             self._stats_label.setText(" · ".join(parts))
         else:
@@ -208,10 +238,14 @@ class AIStreamPanel(QWidget):
 
     def _stream_phase_suffix(self) -> str:
         counts = self._stage_chars.get(self._stage, {})
-        if counts.get("reasoning", 0) > 0:
+        reasoning_n = counts.get("reasoning", 0)
+        content_n = counts.get("content", 0)
+        if reasoning_n > 0 and content_n > 0:
+            return "思考中 · 撰写回答中…"
+        if reasoning_n > 0:
             return "思考中…"
-        if counts.get("content", 0) > 0:
-            return "生成中…"
+        if content_n > 0:
+            return "撰写回答中…"
         return "等待响应…"
 
     def _ensure_stage_header(self, stage: str) -> None:
@@ -227,10 +261,20 @@ class AIStreamPanel(QWidget):
             prefix = "\n" + "─" * 48 + "\n"
         self._reasoning_edit.appendPlainText(f"{prefix}【{title}】\n")
 
+    def _ensure_content_header(self, stage: str) -> None:
+        if stage in self._content_headers_written:
+            return
+        self._content_headers_written.add(stage)
+        prefix = "\n" + "─" * 48 + "\n" if self._reasoning_edit.toPlainText() else ""
+        label = "撰写回答" if stage in ("stage1", "stage2") else "回答"
+        self._reasoning_edit.appendPlainText(f"{prefix}【{label}】\n")
+
     def _append_stream_text_for_stage(self, stage: str, chunk: str, *, kind: str) -> None:
         if not chunk:
             return
         self._ensure_stage_header(stage)
+        if kind == "content":
+            self._ensure_content_header(stage)
         counts = self._stage_chars.setdefault(stage, {"reasoning": 0, "content": 0})
         key = "reasoning" if kind == "reasoning" else "content"
         counts[key] += len(chunk)
@@ -289,10 +333,12 @@ class AIStreamPanel(QWidget):
         counts = self._stage_chars.get(stage_key, {})
         reasoning_n = counts.get("reasoning", 0)
         content_n = counts.get("content", 0)
-        if reasoning_n > 0:
+        if reasoning_n > 0 and content_n > 0:
+            detail = f"思考 {reasoning_n:,} 字 · 回答 {content_n:,} 字"
+        elif reasoning_n > 0:
             detail = f"思考 {reasoning_n:,} 字"
         elif content_n > 0:
-            detail = f"输出 {content_n:,} 字"
+            detail = f"回答 {content_n:,} 字"
         else:
             detail = "无流式文本"
         self._phase_label.setText(f"✓ {title} — 完成 ({elapsed:.1f}s) · {detail}")
@@ -305,6 +351,7 @@ class AIStreamPanel(QWidget):
         self._finalized_stages.clear()
         self._stage_chars.clear()
         self._stage_headers_written.clear()
+        self._content_headers_written.clear()
         self._phase_label.setText("等待分析…")
         self._update_stats()
         self._progress_bar.setValue(0)
@@ -312,6 +359,22 @@ class AIStreamPanel(QWidget):
         self._progress_bar.setStyleSheet(_STYLE_NORMAL)
         self._token_label.setText("—")
         self._red_warned = False
+
+    def clear_stream_output(self) -> None:
+        """Clear only the visible live output pane and local text counters."""
+        self._reasoning_edit.clear()
+        self._reasoning_chars = 0
+        self._content_chars = 0
+        self._stage_chars.clear()
+        self._stage_headers_written.clear()
+        self._content_headers_written.clear()
+        self._finalized_stages.clear()
+        if self._stage:
+            title = self._stage_title(self._stage) if self._stage in ("stage1", "stage2") else "追问"
+            self._phase_label.setText(f"▶ {title} — {self._stream_phase_suffix()}")
+        else:
+            self._phase_label.setText("等待分析…")
+        self._update_stats()
 
     def on_analysis_started(self) -> None:
         self.set_input_enabled(False)
@@ -380,11 +443,8 @@ class AIStreamPanel(QWidget):
         self._append_stream_text_for_stage(stage, chunk, kind="reasoning")
 
     def on_content_token(self, stage: str, chunk: str) -> None:
-        """Show answer stream when the API does not emit reasoning_content (e.g. Claude on KKAI)."""
+        """Stream assistant content (JSON / 撰写回答) into the same pane as reasoning."""
         if not chunk:
-            return
-        counts = self._stage_chars.get(stage, {})
-        if counts.get("reasoning", 0) > 0:
             return
         self._append_stream_text_for_stage(stage, chunk, kind="content")
 
@@ -435,6 +495,9 @@ class AIStreamPanel(QWidget):
 
         self._worker = _ChatWorker(self._session, text, self._cancel_token, parent=self)
         self._worker.reasoning_token.connect(self._append_reasoning)
+        self._worker.content_token.connect(
+            lambda chunk: self._append_stream_text_for_stage("chat", chunk, kind="content")
+        )
         self._worker.finished.connect(self._on_reply_done)
         self._worker.error.connect(self._on_reply_error)
         self._worker.finished.connect(lambda *_: self._on_worker_done())
@@ -442,10 +505,12 @@ class AIStreamPanel(QWidget):
         self._worker.start()
 
     def _on_reply_done(self, content: str, reasoning: str) -> None:
-        del content
         if reasoning and self._reasoning_chars == 0:
             self._append_reasoning(reasoning)
-        self._end_stage("追问")
+        chat_counts = self._stage_chars.get("chat", {})
+        if content and chat_counts.get("content", 0) == 0:
+            self._append_stream_text_for_stage("chat", content, kind="content")
+        self._end_stage("追问", stage="chat")
         if self._session is not None:
             ledger = getattr(self._session, "_ledger", None)
             if ledger is not None and hasattr(ledger, "breakdown"):

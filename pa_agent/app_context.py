@@ -41,7 +41,6 @@ class AppContext:
         from pa_agent.util.event_bus import EventBus
         from pa_agent.security.secret_store import mask_secret
         from pa_agent.data.kline_buffer import KlineBuffer
-        from pa_agent.data.mt5 import MT5Source
         from pa_agent.ai.deepseek_client import DeepSeekClient
         from pa_agent.ai.prompt_assembler import PromptAssembler
         from pa_agent.ai.router import route_strategy_files
@@ -63,19 +62,34 @@ class AppContext:
 
         # ── Data layer ────────────────────────────────────────────────────────
         buffer = KlineBuffer(capacity=1000)
-        data_source = MT5Source()
+        source_kind = getattr(settings.general, "data_source_kind", "akshare_a_share")
+        if source_kind == "mt5":
+            from pa_agent.data.mt5 import MT5Source
+
+            data_source = MT5Source()
+        else:
+            from pa_agent.data.a_share import AShareSource
+
+            data_source = AShareSource()
 
         # Subscribe to the last-used symbol/timeframe from settings
         try:
+            symbol = settings.general.last_symbol
+            timeframe = settings.general.last_timeframe
+            checker = getattr(data_source, "is_symbol_available", None)
+            if callable(checker) and not checker(symbol):
+                symbol = "STOCK:600519"
+            supported_timeframes = data_source.supported_timeframes()
+            if timeframe not in supported_timeframes:
+                timeframe = "15m"
+            settings.general.last_symbol = symbol
+            settings.general.last_timeframe = timeframe
             data_source.connect()
-            data_source.subscribe(
-                settings.general.last_symbol,
-                settings.general.last_timeframe,
-            )
+            data_source.subscribe(symbol, timeframe)
             app_logger.info(
                 "Subscribed to %s %s",
-                settings.general.last_symbol,
-                settings.general.last_timeframe,
+                symbol,
+                timeframe,
             )
         except Exception as exc:  # noqa: BLE001
             app_logger.warning("Initial data source subscription failed: %s", exc)

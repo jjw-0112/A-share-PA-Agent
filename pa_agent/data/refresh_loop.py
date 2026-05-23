@@ -64,18 +64,22 @@ class RefreshLoop(QThread):
                 self._consecutive_failures = 0
                 failure_start = None
 
-                # Only update the forming bar in the buffer.
-                # Closed bars are managed by the buffer's own append logic;
-                # re-appending all bars every tick would corrupt the ordering
-                # because appendleft() inserts at the front each time.
                 if bars:
-                    self._buffer.update_forming(bars[0])
-                    # Promote newly-closed bars: if the previous forming bar's
-                    # ts_open no longer matches bars[0], it has closed — append it.
-                    if len(bars) > 1:
-                        self._buffer.append(bars[1])
+                    if bars[0].closed:
+                        self._buffer.append(bars[0])
+                    else:
+                        self._buffer.update_forming(bars[0])
+                        # Promote newly-closed bars: if the previous forming bar's
+                        # ts_open no longer matches bars[0], it has closed.
+                        if len(bars) > 1:
+                            self._buffer.append(bars[1])
 
                 self.frame_ready.emit(bars)
+                status_fn = getattr(self._source, "session_status", None)
+                if callable(status_fn):
+                    status = str(status_fn() or "")
+                    if status and status != "连续竞价中":
+                        self.status_changed.emit(status)
 
             except DataSourceTransientError as exc:
                 logger.warning("RefreshLoop transient error: %s", exc)
